@@ -37,8 +37,7 @@ let tempMuxPath = '';
 
 const MAX_ENCODER_ATTEMPTS = 4;
 const SAFE_AVM_MAX_WIDTH = 854;
-const ENCODER_STALL_TIMEOUT_MS = 30000;
-const ENCODER_ABSOLUTE_TIMEOUT_MS = 4 * 60 * 1000;
+const ENCODER_STALL_TIMEOUT_MS = 300000; // 5 minutes
 const AVM_CRASH_EXIT_CODES = new Set([
   3221225477, // 0xC0000005 access violation, reported by Windows as an unsigned exit code.
   -1073741819
@@ -500,6 +499,7 @@ function runAV2Encoder(y4mPath, av2Path, qp, speed, totalFrames, runId) {
     let encoderProcess = null;
     let stallTimer = null;
     let lastOutputAt = Date.now();
+    let attemptStartTime = Date.now();
     let currentFrame = 0;
     let fps = 0;
     let lastProgressLogTime = 0;
@@ -577,10 +577,8 @@ function runAV2Encoder(y4mPath, av2Path, qp, speed, totalFrames, runId) {
       }
 
       if (updated) {
-        const elapsedSeconds = Math.max((Date.now() - lastOutputAt) / 1000, 0.001);
-        if (fps === 0 && currentFrame > 0) {
-          fps = currentFrame / elapsedSeconds;
-        }
+        const elapsedSeconds = Math.max((Date.now() - attemptStartTime) / 1000, 0.001);
+        fps = currentFrame / elapsedSeconds;
         
         // Log periodically
         const now = Date.now();
@@ -636,6 +634,7 @@ function runAV2Encoder(y4mPath, av2Path, qp, speed, totalFrames, runId) {
       encoderProcess = encoder;
       activeProcesses.push(encoder);
       lastOutputAt = Date.now();
+      attemptStartTime = Date.now();
 
       stallTimer = setInterval(() => {
         if (encoderClosed || settled) {
@@ -645,8 +644,7 @@ function runAV2Encoder(y4mPath, av2Path, qp, speed, totalFrames, runId) {
 
         const now = Date.now();
         const stalled = now - lastOutputAt > ENCODER_STALL_TIMEOUT_MS;
-        const expired = now - lastOutputAt > ENCODER_ABSOLUTE_TIMEOUT_MS;
-        if (stalled || expired) {
+        if (stalled) {
           killedForStall = true;
           addLog(`avmenc.exe produced no progress for ${Math.round((now - lastOutputAt) / 1000)}s; restarting with safer settings...`);
           try { encoder.kill('SIGINT'); } catch(e) {}
