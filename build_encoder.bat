@@ -32,92 +32,31 @@ if not exist "!PERL_PATH!\perl.exe" (
 )
 set "PATH=!PERL_PATH!;%PATH%"
 
-:: 1. Download portable CMake
-if not exist "%ROOT%tools\cmake\bin\cmake.exe" (
-    echo [1/3] Downloading portable CMake...
-    echo       (This is a one-time download, ~30 MB)
-    if not exist "%ROOT%tools" mkdir "%ROOT%tools"
-    powershell -NoProfile -Command ^
-        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; " ^
-        "$ProgressPreference = 'SilentlyContinue'; " ^
-        "try { " ^
-        "  Write-Host '        Downloading from Kitware...'; " ^
-        "  Invoke-WebRequest -Uri 'https://github.com/Kitware/CMake/releases/download/v3.29.3/cmake-3.29.3-windows-x86_64.zip' -OutFile '%ROOT%tools\cmake.zip' -UseBasicParsing; " ^
-        "  Write-Host '        Extracting...'; " ^
-        "  Expand-Archive -Path '%ROOT%tools\cmake.zip' -DestinationPath '%ROOT%tools\cmake_temp' -Force; " ^
-        "  $src = Get-ChildItem -Path '%ROOT%tools\cmake_temp' -Directory | Select-Object -First 1; " ^
-        "  if (-not (Test-Path '%ROOT%tools\cmake')) { New-Item -ItemType Directory -Path '%ROOT%tools\cmake' | Out-Null }; " ^
-        "  Copy-Item -Path (Join-Path $src.FullName '*') -Destination '%ROOT%tools\cmake' -Recurse -Force; " ^
-        "  Remove-Item '%ROOT%tools\cmake_temp' -Recurse -Force; " ^
-        "  Remove-Item '%ROOT%tools\cmake.zip' -Force; " ^
-        "  Write-Host '        CMake installed successfully.'; " ^
-        "} catch { " ^
-        "  Write-Host ('        [ERROR] Failed to download CMake: ' + $_.Exception.Message); " ^
-        "  exit 1; " ^
-        "}"
-    if !errorlevel! neq 0 ( pause & exit /b 1 )
-) else (
-    echo [1/3] Portable CMake is already installed.
-)
-set "PATH=%ROOT%tools\cmake\bin;%PATH%"
-
-:: 2. Download portable GCC (w64devkit)
-if not exist "%ROOT%tools\mingw\bin\gcc.exe" (
-    echo [2/3] Downloading portable GCC compiler (w64devkit)...
-    echo       (This is a one-time download, ~85 MB)
+:: 1. Download and install portable compiler toolchain (WinLibs GCC + MinGW-w64 + NASM + CMake)
+if not exist "%ROOT%tools\mingw64\bin\gcc.exe" (
+    echo Downloading portable compiler toolchain [GCC, MinGW-w64, NASM, CMake]...
+    echo This is a one-time download, ~270 MB
     if not exist "%ROOT%tools" mkdir "%ROOT%tools"
     powershell -NoProfile -Command ^
         "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; " ^
         "$ProgressPreference = 'SilentlyContinue'; " ^
         "try { " ^
         "  Write-Host '        Downloading from GitHub...'; " ^
-        "  Invoke-WebRequest -Uri 'https://github.com/skeeto/w64devkit/releases/download/v2.0.0/w64devkit-2.0.0.zip' -OutFile '%ROOT%tools\w64devkit.zip' -UseBasicParsing; " ^
+        "  Invoke-WebRequest -Uri 'https://github.com/brechtsanders/winlibs_mingw/releases/download/14.2.0posix-19.1.1-12.0.0-ucrt-r2/winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r2.zip' -OutFile '%ROOT%tools\winlibs.zip' -UseBasicParsing; " ^
         "  Write-Host '        Extracting...'; " ^
-        "  Expand-Archive -Path '%ROOT%tools\w64devkit.zip' -DestinationPath '%ROOT%tools\mingw_temp' -Force; " ^
-        "  $src = Get-ChildItem -Path '%ROOT%tools\mingw_temp' -Directory | Select-Object -First 1; " ^
-        "  if (-not (Test-Path '%ROOT%tools\mingw')) { New-Item -ItemType Directory -Path '%ROOT%tools\mingw' | Out-Null }; " ^
-        "  Copy-Item -Path (Join-Path $src.FullName '*') -Destination '%ROOT%tools\mingw' -Recurse -Force; " ^
-        "  Remove-Item '%ROOT%tools\mingw_temp' -Recurse -Force; " ^
-        "  Remove-Item '%ROOT%tools\w64devkit.zip' -Force; " ^
-        "  Write-Host '        MinGW-w64 compiler installed successfully.'; " ^
+        "  Expand-Archive -Path '%ROOT%tools\winlibs.zip' -DestinationPath '%ROOT%tools' -Force; " ^
+        "  Remove-Item '%ROOT%tools\winlibs.zip' -Force; " ^
+        "  Write-Host '        Compiler toolchain installed successfully.'; " ^
         "} catch { " ^
-        "  Write-Host ('        [ERROR] Failed to download w64devkit: ' + $_.Exception.Message); " ^
+        "  Write-Host ('        [ERROR] Failed to download/extract toolchain: ' + $_.Exception.Message); " ^
         "  exit 1; " ^
         "}"
     if !errorlevel! neq 0 ( pause & exit /b 1 )
 ) else (
-    echo [2/3] Portable GCC compiler is already installed.
+    echo Portable compiler toolchain is already installed.
 )
-set "PATH=%ROOT%tools\mingw\bin;%PATH%"
+set "PATH=%ROOT%tools\mingw64\bin;%PATH%"
 
-:: 3. Download portable NASM
-if not exist "%ROOT%tools\nasm\nasm.exe" (
-    echo [3/3] Downloading portable NASM assembler...
-    echo       (This is a one-time download, ~2 MB)
-    if not exist "%ROOT%tools" mkdir "%ROOT%tools"
-    powershell -NoProfile -Command ^
-        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; " ^
-        "$ProgressPreference = 'SilentlyContinue'; " ^
-        "try { " ^
-        "  Write-Host '        Downloading from nasm.us...'; " ^
-        "  Invoke-WebRequest -Uri 'https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip' -OutFile '%ROOT%tools\nasm.zip' -UseBasicParsing; " ^
-        "  Write-Host '        Extracting...'; " ^
-        "  Expand-Archive -Path '%ROOT%tools\nasm.zip' -DestinationPath '%ROOT%tools\nasm_temp' -Force; " ^
-        "  $src = Get-ChildItem -Path '%ROOT%tools\nasm_temp' -Directory | Select-Object -First 1; " ^
-        "  if (-not (Test-Path '%ROOT%tools\nasm')) { New-Item -ItemType Directory -Path '%ROOT%tools\nasm' | Out-Null }; " ^
-        "  Copy-Item -Path (Join-Path $src.FullName 'nasm.exe'), (Join-Path $src.FullName 'ndisasm.exe') -Destination '%ROOT%tools\nasm' -Force; " ^
-        "  Remove-Item '%ROOT%tools\nasm_temp' -Recurse -Force; " ^
-        "  Remove-Item '%ROOT%tools\nasm.zip' -Force; " ^
-        "  Write-Host '        NASM installed successfully.'; " ^
-        "} catch { " ^
-        "  Write-Host ('        [ERROR] Failed to download NASM: ' + $_.Exception.Message); " ^
-        "  exit 1; " ^
-        "}"
-    if !errorlevel! neq 0 ( pause & exit /b 1 )
-) else (
-    echo [3/3] Portable NASM is already installed.
-)
-set "PATH=%ROOT%tools\nasm;%PATH%"
 
 :: Clone AVM repository if missing
 if not exist "%ROOT%avm\CMakeLists.txt" (
@@ -133,11 +72,12 @@ if not exist "%ROOT%avm\CMakeLists.txt" (
 :: Configure and Build AVM
 echo.
 echo Configuring AVM build system...
-if not exist "%ROOT%avm\build" mkdir "%ROOT%avm\build"
+if exist "%ROOT%avm\build" rd /s /q "%ROOT%avm\build"
+mkdir "%ROOT%avm\build"
 pushd "%ROOT%avm\build"
 
-:: Run CMake with MinGW Makefiles generator
-cmake -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DENABLE_DOCS=OFF -DENABLE_TESTS=OFF ..
+:: Run CMake with MinGW Makefiles generator, disabling TFLite-dependent features to prevent compiler conflicts
+cmake -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DENABLE_DOCS=OFF -DENABLE_TESTS=OFF -DCONFIG_ML_PART_SPLIT=0 -DCONFIG_DIP_EXT_PRUNING=0 -DCONFIG_TENSORFLOW_LITE=0 ..
 if !errorlevel! neq 0 (
     echo [ERROR] CMake configuration failed.
     popd
@@ -146,7 +86,7 @@ if !errorlevel! neq 0 (
 )
 
 echo.
-echo Compiling avmenc (this will take several minutes)...
+echo Compiling avmenc - this will take several minutes...
 cmake --build . --target avmenc -j%NUMBER_OF_PROCESSORS%
 if !errorlevel! neq 0 (
     echo [ERROR] Compilation failed.
@@ -160,10 +100,11 @@ popd
 :: Copy binary to build folder
 if not exist "%ROOT%build" mkdir "%ROOT%build"
 copy /y "%ROOT%avm\build\avmenc.exe" "%ROOT%build\avmenc.exe"
+echo local_build > "%ROOT%build\avmenc.version"
 
 echo.
 echo ==========================================================
-echo  AV2 reference encoder compiled successfully!
+echo  AV2 reference encoder compiled successfully.
 echo  Binary is located at: build\avmenc.exe
 echo ==========================================================
 echo.

@@ -3,7 +3,8 @@ av2_gui/backend/node_modules/
 av2_gui/frontend/node_modules/
 
 # Portable tools (auto-downloaded by launch.bat)
-tools/
+tools/*
+!tools/check_encoder.ps1
 
 # AVM source code (users compile separately)
 avm/

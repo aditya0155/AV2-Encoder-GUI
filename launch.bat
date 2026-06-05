@@ -169,46 +169,27 @@ if not exist "%ROOT%av2_gui\frontend\node_modules\" (
 :: =====================================================
 echo [4/4] Checking AV2 encoder binary...
 
+if not exist "%ROOT%build" mkdir "%ROOT%build"
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\check_encoder.ps1"
+
+if %errorlevel% equ 0 goto :encoder_ready
+echo.
+echo [WARNING] Automatic avmenc.exe download failed or no release is available yet.
+echo           Starting automated local compilation from source...
+echo           (This will download portable CMake, GCC, and NASM, then build AVM)
+echo           (Takes ~5-10 minutes, only runs once)
+echo.
+call "%ROOT%build_encoder.bat"
 if not exist "%ROOT%build\avmenc.exe" (
-    echo        avmenc.exe not found in build\ folder.
-    echo        Attempting to download precompiled avmenc.exe from GitHub...
-    echo        (This is a one-time download from the latest project release, ~10 MB)
     echo.
-    
-    if not exist "%ROOT%build" mkdir "%ROOT%build"
-    
-    powershell -NoProfile -Command ^
-        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; " ^
-        "$ProgressPreference = 'SilentlyContinue'; " ^
-        "try { " ^
-        "  Write-Host '        Downloading from github.com/aditya0155/AV2-Encoder-GUI...'; " ^
-        "  Invoke-WebRequest -Uri 'https://github.com/aditya0155/AV2-Encoder-GUI/releases/latest/download/avmenc.exe' -OutFile '%ROOT%build\avmenc.exe' -UseBasicParsing; " ^
-        "  Write-Host '        avmenc.exe downloaded and installed successfully.'; " ^
-        "} catch { " ^
-        "  Write-Host '        [WARNING] Failed to download pre-compiled avmenc.exe.'; " ^
-        "  Write-Host ('        Error detail: ' + $_.Exception.Message); " ^
-        "  exit 1; " ^
-        "}"
-        
-    if !errorlevel! neq 0 (
-        echo.
-        echo [WARNING] Automatic avmenc.exe download failed or no release is available yet.
-        echo           Starting automated local compilation from source...
-        echo           (This will download portable CMake, GCC, and NASM, then build AVM)
-        echo           (Takes ~5-10 minutes, only runs once)
-        echo.
-        call "%ROOT%build_encoder.bat"
-        if not exist "%ROOT%build\avmenc.exe" (
-            echo.
-            echo [ERROR] Automated compilation failed.
-            echo         Please compile avmenc.exe manually and place it in the build\ folder.
-            echo.
-            pause
-        )
-    )
-) else (
-    echo        avmenc.exe found in build\ folder.
+    echo [ERROR] Automated compilation failed.
+    echo         Please compile avmenc.exe manually and place it in the build\ folder.
+    echo.
+    pause
 )
+
+:encoder_ready
 
 echo.
 echo ==========================================================
