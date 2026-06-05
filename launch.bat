@@ -193,12 +193,18 @@ if not exist "%ROOT%build\avmenc.exe" (
     if !errorlevel! neq 0 (
         echo.
         echo [WARNING] Automatic avmenc.exe download failed or no release is available yet.
-        echo           You can compile it manually from source: https://gitlab.com/AOMediaCodec/avm
-        echo           And place the compiled avmenc.exe in the build\ folder.
+        echo           Starting automated local compilation from source...
+        echo           (This will download portable CMake, GCC, and NASM, then build AVM)
+        echo           (Takes ~5-10 minutes, only runs once)
         echo.
-        echo           The GUI will launch now, but encoding will fail until avmenc.exe is present.
-        echo.
-        pause
+        call "%ROOT%build_encoder.bat"
+        if not exist "%ROOT%build\avmenc.exe" (
+            echo.
+            echo [ERROR] Automated compilation failed.
+            echo         Please compile avmenc.exe manually and place it in the build\ folder.
+            echo.
+            pause
+        )
     )
 ) else (
     echo        avmenc.exe found in build\ folder.
