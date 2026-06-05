@@ -32,6 +32,22 @@ let tempMuxPath = '';
 let tempListPath = '';
 let activeSegments = [];
 
+export function disableProcessEcoQoS(pid) {
+  if (process.platform !== 'win32') return;
+  const psScript = path.resolve(process.cwd(), 'disable_ecoqos.ps1');
+  if (fs.existsSync(psScript)) {
+    const ps = spawn('powershell.exe', [
+      '-NoProfile',
+      '-ExecutionPolicy', 'Bypass',
+      '-File', psScript,
+      '-targetPid', pid
+    ]);
+    ps.on('error', (err) => {
+      console.error('Failed to run disable_ecoqos.ps1:', err);
+    });
+  }
+}
+
 export function getStatus() {
   return currentJob;
 }
@@ -350,6 +366,7 @@ function splitVideoIntoSegments(inputFile, segments, resolutionScale, limitFrame
       if (os.setPriority) {
         os.setPriority(ffmpeg.pid, os.constants.priority.PRIORITY_ABOVE_NORMAL);
       }
+      disableProcessEcoQoS(ffmpeg.pid);
     } catch (e) {
       console.error('Failed to set priority for FFmpeg split:', e);
     }
@@ -474,6 +491,7 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames) {
         if (os.setPriority) {
           os.setPriority(encoder.pid, os.constants.priority.PRIORITY_ABOVE_NORMAL);
         }
+        disableProcessEcoQoS(encoder.pid);
       } catch (e) {
         console.error(`Failed to set priority for segment ${i}:`, e);
       }
@@ -730,6 +748,7 @@ function muxSegmentsWithAudio({ listPath, sourcePath, outputPath, audioMode, aud
       if (os.setPriority) {
         os.setPriority(ffmpeg.pid, os.constants.priority.PRIORITY_ABOVE_NORMAL);
       }
+      disableProcessEcoQoS(ffmpeg.pid);
     } catch (e) {
       console.error('Failed to set priority for FFmpeg mux:', e);
     }
