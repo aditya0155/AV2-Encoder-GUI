@@ -345,6 +345,14 @@ function splitVideoIntoSegments(inputFile, segments, resolutionScale, limitFrame
 
     const ffmpeg = spawn('ffmpeg', args);
     activeProcesses.push(ffmpeg);
+
+    try {
+      if (os.setPriority) {
+        os.setPriority(ffmpeg.pid, os.constants.priority.PRIORITY_ABOVE_NORMAL);
+      }
+    } catch (e) {
+      console.error('Failed to set priority for FFmpeg split:', e);
+    }
     
     let parsedHeader = false;
     let frameSize = 0;
@@ -461,6 +469,14 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames) {
       
       const encoder = spawn(AVM_ENC_PATH, args);
       activeProcesses.push(encoder);
+
+      try {
+        if (os.setPriority) {
+          os.setPriority(encoder.pid, os.constants.priority.PRIORITY_ABOVE_NORMAL);
+        }
+      } catch (e) {
+        console.error(`Failed to set priority for segment ${i}:`, e);
+      }
       
       encoder.stderr.on('data', (data) => {
         const text = data.toString();
@@ -709,6 +725,14 @@ function muxSegmentsWithAudio({ listPath, sourcePath, outputPath, audioMode, aud
     addLog(`Running: ffmpeg ${args.join(' ')}`);
     const ffmpeg = spawn('ffmpeg', args);
     activeProcesses.push(ffmpeg);
+
+    try {
+      if (os.setPriority) {
+        os.setPriority(ffmpeg.pid, os.constants.priority.PRIORITY_ABOVE_NORMAL);
+      }
+    } catch (e) {
+      console.error('Failed to set priority for FFmpeg mux:', e);
+    }
 
     let ffmpegStderr = [];
     ffmpeg.stderr.on('data', (data) => {
