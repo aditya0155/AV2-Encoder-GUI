@@ -24,7 +24,9 @@ export default function App() {
   const [isConnecting, setIsConnecting] = useState(true);
   const [limitFrames, setLimitFrames] = useState(0); // 0 or empty means no limit
   const [resolutionScale, setResolutionScale] = useState('original'); // 'original', '1080p', '720p', '480p', '360p', '240p'
-  const [workers, setWorkers] = useState(4); // default parallel workers count
+  const [workers, setWorkers] = useState(16); // default parallel workers count
+  const [maxCpus, setMaxCpus] = useState(16); // dynamic maximum based on system info
+
   
   // Fallback Web File Explorer States
   const [isExplorerOpen, setIsExplorerOpen] = useState(false);
@@ -48,9 +50,22 @@ export default function App() {
   const consoleEndRef = useRef(null);
   const wsRef = useRef(null);
 
-  // Connect to local backend WebSocket
+  // Connect to local backend WebSocket and fetch system CPU count
   useEffect(() => {
     connectWebSocket();
+    
+    // Fetch CPU core count to dynamically adjust slider and default workers
+    fetch('http://localhost:5000/api/sys-info')
+      .then(res => res.json())
+      .then(data => {
+        if (data && data.cpus) {
+          const cores = parseInt(data.cpus) || 16;
+          setMaxCpus(cores);
+          setWorkers(cores);
+        }
+      })
+      .catch(err => console.error('Failed to fetch system info:', err));
+
     return () => {
       if (wsRef.current) wsRef.current.close();
     };
@@ -545,10 +560,10 @@ export default function App() {
                       <span style={{ fontSize: '14px', fontWeight: 'bold', color: 'var(--accent-cyan)' }}>{workers} threads</span>
                     </div>
                     <div className="slider-container">
-                      <input type="range" className="slider" min="1" max="16" value={workers} onChange={(e) => setWorkers(parseInt(e.target.value))} disabled={isEncoding} />
+                      <input type="range" className="slider" min="1" max={Math.max(16, maxCpus)} value={workers} onChange={(e) => setWorkers(parseInt(e.target.value))} disabled={isEncoding} />
                     </div>
                     <span style={{ fontSize: '11px', color: 'var(--text-low)', display: 'block', marginTop: '6px' }}>
-                      Spawns parallel instances of avmenc.exe to encode segment chunks, utilizing multiple CPU cores. Recommended: 4-8.
+                      Spawns parallel instances of avmenc.exe to encode segment chunks, utilizing multiple CPU cores. Recommended: use all logical processors (default).
                     </span>
                   </div>
                 </div>
