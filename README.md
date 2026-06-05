@@ -2,6 +2,11 @@
 
 A web-based GUI for the **AV2 (AVM) reference video codec** with segment-based parallel encoding for full CPU utilization.
 
+## Screenshots
+
+![Dashboard](images/ss_1.png)
+![Encoding Progress](images/ss_2.png)
+
 ## What It Does
 
 - Splits video into N segments, encodes them in parallel using all CPU cores
