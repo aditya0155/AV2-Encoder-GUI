@@ -36,11 +36,14 @@ let tempMuxPath = '';
 let tempListPath = '';
 let activeSegments = [];
 
-// Keep chunks long enough for AVM's lookahead/reference structure. Very short
-// chunks can underuse CPU and have been observed to crash the Windows build.
-const MIN_FRAMES_PER_SEGMENT = 32;
-const MAX_ENCODER_ATTEMPTS = 3;
-const MAX_PARALLEL_ENCODERS = 4;
+// AVM's Windows encoder build has unstable internal threading/GF paths. Use
+// short all-keyframe chunks and fill the CPU with external process parallelism.
+const TARGET_FRAMES_PER_SEGMENT = 12;
+const MAX_ENCODER_ATTEMPTS = 4;
+const SAFE_AVM_MAX_WIDTH = 854;
+const ENCODER_STALL_TIMEOUT_MS = 30000;
+const ENCODER_ABSOLUTE_TIMEOUT_MS = 4 * 60 * 1000;
+const MAX_ENCODER_CONCURRENCY = 32;
 const AVM_CRASH_EXIT_CODES = new Set([
   3221225477, // 0xC0000005 access violation, reported by Windows as an unsigned exit code.
   -1073741819
@@ -169,36 +172,27 @@ function getScaledDimensions(videoInfo, resolutionScale) {
   return { width: targetWidth, height: scaledHeight };
 }
 
+function chooseEffectiveResolutionScale(videoInfo, requestedScale) {
+  const sourceWidth = parseInt(videoInfo.width, 10) || 0;
+  if (requestedScale && requestedScale !== 'original') return requestedScale;
+  if (sourceWidth > SAFE_AVM_MAX_WIDTH) return '480p';
+  return 'original';
+}
+
 function planParallelism(totalFrames, requestedWorkers) {
   const logicalCpus = Math.max(1, os.cpus().length);
   const targetCpuThreads = clampInt(requestedWorkers, 1, logicalCpus, logicalCpus);
-  const maxSegmentsByFrames = Math.max(1, Math.floor(totalFrames / MIN_FRAMES_PER_SEGMENT));
-  const maxEncoderProcesses = Math.min(MAX_PARALLEL_ENCODERS, targetCpuThreads);
-  const numSegments = Math.max(1, Math.min(maxEncoderProcesses, totalFrames, maxSegmentsByFrames));
-  const threadsPerEncoder = Math.max(1, Math.ceil(targetCpuThreads / numSegments));
+  const numSegments = Math.max(1, Math.ceil(totalFrames / TARGET_FRAMES_PER_SEGMENT));
+  const encoderConcurrency = Math.max(1, Math.min(targetCpuThreads * 2, MAX_ENCODER_CONCURRENCY, numSegments));
 
   return {
     logicalCpus,
     targetCpuThreads,
     numSegments,
-    threadsPerEncoder,
-    actualCpuThreads: numSegments * threadsPerEncoder
+    encoderConcurrency,
+    threadsPerEncoder: 1,
+    actualCpuThreads: encoderConcurrency
   };
-}
-
-function getEncoderTileArgs(width, height, threads) {
-  if (threads <= 1) return ['--row-mt=1'];
-
-  const maxColsLog = width >= 1920 ? 2 : (width >= 854 ? 1 : 0);
-  let colsLog = 0;
-
-  while ((1 << colsLog) < threads && colsLog < maxColsLog) {
-    colsLog++;
-  }
-
-  const args = ['--row-mt=1'];
-  if (colsLog > 0) args.push(`--tile-columns=${colsLog}`);
-  return args;
 }
 
 export function cancelEncoding() {
@@ -353,16 +347,18 @@ async function runPipeline({ inputFile, outputFile, qp, speed, audioMode, audioB
     // Step 2: Slicing into segments
     updateJob({ status: 'preparing' });
     
+    const effectiveResolutionScale = chooseEffectiveResolutionScale(videoInfo, resolutionScale);
+    if (effectiveResolutionScale !== resolutionScale) {
+      addLog(`Reference-safe mode: downscaling ${videoInfo.width}x${videoInfo.height} input to ${effectiveResolutionScale} for AVM stability and CPU utilization.`);
+    }
     const parallelism = planParallelism(jobTotalFrames, workers);
-    const outputDimensions = getScaledDimensions(videoInfo, resolutionScale);
+    const outputDimensions = getScaledDimensions(videoInfo, effectiveResolutionScale);
     const numSegments = parallelism.numSegments;
     const framesPerSegment = Math.floor(jobTotalFrames / numSegments);
     if (parallelism.targetCpuThreads < (parseInt(workers, 10) || parallelism.logicalCpus)) {
       addLog(`Note: Capped requested CPU threads at ${parallelism.targetCpuThreads}, matching available logical CPUs.`);
     }
-    if (numSegments < parallelism.targetCpuThreads) {
-      addLog(`Note: Planned ${numSegments} encoder process(es) with ${parallelism.threadsPerEncoder} thread(s) each. This avoids AVM crashes from launching too many 1080p encoders at once.`);
-    }
+    addLog(`Planned ${numSegments} short segment(s), running up to ${parallelism.encoderConcurrency} single-threaded encoder process(es) at once.`);
     const segments = [];
     let startFrame = 0;
     
@@ -390,7 +386,7 @@ async function runPipeline({ inputFile, outputFile, qp, speed, audioMode, audioB
     activeSegments = segments;
     
     addLog(`Step 1/3: Splitting video into ${numSegments} segments in parallel...`);
-    await splitVideoIntoSegments(inputFile, segments, resolutionScale, jobTotalFrames, runId);
+    await splitVideoIntoSegments(inputFile, segments, effectiveResolutionScale, jobTotalFrames, runId);
     throwIfCancelled(runId);
     addLog('Video split complete.');
 
@@ -697,14 +693,15 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
     const activeEncoders = new Set();
     const pendingSegments = [...segments.keys()];
     const runningSegments = new Set();
+    const startedSegments = new Set();
     const attemptsBySegment = new Array(segments.length).fill(0);
     const lastProgressLogAt = new Array(segments.length).fill(0);
-    const concurrency = Math.max(1, segments.length);
+    const concurrency = Math.max(1, Math.min(parallelism?.encoderConcurrency || segments.length, segments.length));
     const logicalCpus = parallelism?.logicalCpus || Math.max(1, os.cpus().length);
-    const encoderThreads = Math.max(1, parallelism?.threadsPerEncoder || Math.ceil(logicalCpus / concurrency));
+    const encoderThreads = 1;
     const targetCpuThreads = parallelism?.targetCpuThreads || logicalCpus;
     const actualCpuThreads = parallelism?.actualCpuThreads || (concurrency * encoderThreads);
-    addLog(`Encoder threading: ${concurrency} parallel encoder(s) x ${encoderThreads} thread(s) each (${actualCpuThreads} worker thread slots), targeting ${targetCpuThreads}/${logicalCpus} logical CPU thread(s).`);
+    addLog(`Encoder scheduling: up to ${concurrency} parallel avmenc.exe process(es) x ${encoderThreads} thread each, targeting ${targetCpuThreads}/${logicalCpus} logical CPU thread(s).`);
 
     const progressTimer = setInterval(() => {
       if (!isActiveRun(runId)) {
@@ -779,22 +776,26 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
 
     function buildEncoderArgs(seg, attempt) {
       const speedValue = clampInt(speed, 0, 9, 8);
-      const safeSpeed = Math.min(speedValue, 8);
       const qpValue = clampInt(qp, 0, 255, 45);
-      const threads = attempt === 1
-        ? encoderThreads
-        : (attempt === 2 ? Math.max(1, Math.floor(encoderThreads / 2)) : 1);
       const args = [
         '--disable-warning-prompt',
         `--qp=${qpValue}`,
-        `--cpu-used=${attempt >= 3 ? safeSpeed : speedValue}`,
-        `--threads=${threads}`,
-        '--auto-alt-ref=0',
-        '--enable-keyframe-filtering=0',
-        '--enable-overlay=0',
-        '--monotonic-output-order=1',
-        ...getEncoderTileArgs(seg.width || 0, seg.height || 0, threads),
+        `--cpu-used=${speedValue}`,
+        '--threads=1',
       ];
+
+      if (attempt === 1) {
+        args.push('--kf-min-dist=1', '--kf-max-dist=1');
+      } else if (attempt === 2) {
+        args.push('--auto-alt-ref=0', '--kf-min-dist=1', '--kf-max-dist=1');
+      } else if (attempt === 3) {
+        args.push(
+          '--auto-alt-ref=0',
+          '--enable-keyframe-filtering=0',
+          '--enable-overlay=0',
+          '--monotonic-output-order=1',
+        );
+      }
       if (seg.frames > 0) {
         args.push(`--limit=${seg.frames}`);
       }
@@ -846,7 +847,7 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
             fs.unlinkSync(seg.av2Path);
           }
         } catch(e) {}
-        segmentFramesProcessed[i] = 0;
+        segmentFramesProcessed[i] = Math.max(segmentFramesProcessed[i], Math.min(1, seg.frames));
         segmentFps[i] = 0;
         segmentPocs[i].clear();
         pendingSegments.unshift(i);
@@ -872,6 +873,9 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
 
       const attempt = attemptsBySegment[i];
       const args = buildEncoderArgs(seg, attempt);
+      let lastOutputAt = Date.now();
+      let encoderClosed = false;
+      let killedForStall = false;
 
       if (attempt > 1) {
         addLog(`[Segment ${i}] Retry attempt ${attempt}/${MAX_ENCODER_ATTEMPTS}: ${AVM_ENC_PATH} ${args.join(' ')}`);
@@ -882,6 +886,31 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
       const encoder = spawn(AVM_ENC_PATH, args);
       activeEncoders.add(encoder);
       activeProcesses.push(encoder);
+      startedSegments.add(i);
+      segmentFramesProcessed[i] = Math.max(segmentFramesProcessed[i], Math.min(Math.ceil(seg.frames * 0.25), seg.frames));
+      updateProgress();
+
+      const stallTimer = setInterval(() => {
+        if (encoderClosed || settled) {
+          clearInterval(stallTimer);
+          return;
+        }
+
+        const now = Date.now();
+        const stalled = now - lastOutputAt > ENCODER_STALL_TIMEOUT_MS;
+        const expired = now - segmentStartTimes[i] > ENCODER_ABSOLUTE_TIMEOUT_MS;
+        if (stalled || expired) {
+          killedForStall = true;
+          addLog(`[Segment ${i}] avmenc.exe produced no progress for ${Math.round((now - lastOutputAt) / 1000)}s; restarting with safer settings...`);
+          try { encoder.kill('SIGINT'); } catch(e) {}
+          setTimeout(() => {
+            if (!encoderClosed) {
+              try { encoder.kill('SIGKILL'); } catch(e) {}
+            }
+          }, 3000);
+          clearInterval(stallTimer);
+        }
+      }, 5000);
 
       try {
         if (os.setPriority) {
@@ -893,21 +922,30 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
       }
 
       encoder.stderr.on('data', (data) => {
+        lastOutputAt = Date.now();
         stderrTail = (stderrTail + data.toString()).slice(-2000);
         handleEncoderOutput(i, data, 'stderr');
       });
       encoder.stdout.on('data', (data) => {
+        lastOutputAt = Date.now();
         stdoutTail = (stdoutTail + data.toString()).slice(-2000);
         handleEncoderOutput(i, data, 'stdout');
       });
 
       encoder.on('close', (code) => {
+        encoderClosed = true;
+        clearInterval(stallTimer);
         activeProcesses = activeProcesses.filter(p => p !== encoder);
         activeEncoders.delete(encoder);
 
         if (settled) return;
         if (!isActiveRun(runId)) {
           settleReject(new CancellationError());
+          return;
+        }
+
+        if (killedForStall) {
+          retryOrFailSegment(i, 'stalled', stderrTail.trim(), stdoutTail.trim());
           return;
         }
 
@@ -931,6 +969,8 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
       });
 
       encoder.on('error', (err) => {
+        encoderClosed = true;
+        clearInterval(stallTimer);
         activeProcesses = activeProcesses.filter(p => p !== encoder);
         activeEncoders.delete(encoder);
         runningSegments.delete(i);
