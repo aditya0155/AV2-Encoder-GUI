@@ -40,6 +40,7 @@ let activeSegments = [];
 // chunks can underuse CPU and have been observed to crash the Windows build.
 const MIN_FRAMES_PER_SEGMENT = 32;
 const MAX_ENCODER_ATTEMPTS = 3;
+const MAX_PARALLEL_ENCODERS = 4;
 const AVM_CRASH_EXIT_CODES = new Set([
   3221225477, // 0xC0000005 access violation, reported by Windows as an unsigned exit code.
   -1073741819
@@ -172,14 +173,16 @@ function planParallelism(totalFrames, requestedWorkers) {
   const logicalCpus = Math.max(1, os.cpus().length);
   const targetCpuThreads = clampInt(requestedWorkers, 1, logicalCpus, logicalCpus);
   const maxSegmentsByFrames = Math.max(1, Math.floor(totalFrames / MIN_FRAMES_PER_SEGMENT));
-  const numSegments = Math.max(1, Math.min(targetCpuThreads, totalFrames, maxSegmentsByFrames));
+  const maxEncoderProcesses = Math.min(MAX_PARALLEL_ENCODERS, targetCpuThreads);
+  const numSegments = Math.max(1, Math.min(maxEncoderProcesses, totalFrames, maxSegmentsByFrames));
   const threadsPerEncoder = Math.max(1, Math.ceil(targetCpuThreads / numSegments));
 
   return {
     logicalCpus,
     targetCpuThreads,
     numSegments,
-    threadsPerEncoder
+    threadsPerEncoder,
+    actualCpuThreads: numSegments * threadsPerEncoder
   };
 }
 
@@ -367,7 +370,7 @@ async function runPipeline({ inputFile, outputFile, qp, speed, audioMode, audioB
       addLog(`Note: Capped requested CPU threads at ${parallelism.targetCpuThreads}, matching available logical CPUs.`);
     }
     if (numSegments < parallelism.targetCpuThreads) {
-      addLog(`Note: Planned ${numSegments} encoder segment(s) with about ${parallelism.threadsPerEncoder} thread(s) each so chunks stay at least ${MIN_FRAMES_PER_SEGMENT} frames.`);
+      addLog(`Note: Planned ${numSegments} encoder process(es) with ${parallelism.threadsPerEncoder} thread(s) each. This avoids AVM crashes from launching too many 1080p encoders at once.`);
     }
     const segments = [];
     let startFrame = 0;
@@ -709,7 +712,8 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
     const logicalCpus = parallelism?.logicalCpus || Math.max(1, os.cpus().length);
     const encoderThreads = Math.max(1, parallelism?.threadsPerEncoder || Math.ceil(logicalCpus / concurrency));
     const targetCpuThreads = parallelism?.targetCpuThreads || logicalCpus;
-    addLog(`Encoder threading: ${concurrency} parallel encoder(s) x ${encoderThreads} thread(s) each, targeting ${targetCpuThreads}/${logicalCpus} logical CPU thread(s).`);
+    const actualCpuThreads = parallelism?.actualCpuThreads || (concurrency * encoderThreads);
+    addLog(`Encoder threading: ${concurrency} parallel encoder(s) x ${encoderThreads} thread(s) each (${actualCpuThreads} worker thread slots), targeting ${targetCpuThreads}/${logicalCpus} logical CPU thread(s).`);
 
     const progressTimer = setInterval(() => {
       if (!isActiveRun(runId)) {
@@ -888,6 +892,7 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
         if (os.setPriority) {
           os.setPriority(encoder.pid, os.constants.priority.PRIORITY_ABOVE_NORMAL);
         }
+        disableProcessEcoQoS(encoder.pid);
       } catch (e) {
         console.error(`Failed to set priority for segment ${i}:`, e);
       }

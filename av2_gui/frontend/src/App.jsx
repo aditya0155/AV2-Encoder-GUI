@@ -556,14 +556,14 @@ export default function App() {
                   {/* Parallel Workers Slider */}
                   <div className="form-group" style={{ marginTop: '20px', marginBottom: 0 }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-                      <span className="form-label" style={{ margin: 0 }}>Parallel Encoding Workers</span>
+                      <span className="form-label" style={{ margin: 0 }}>CPU Thread Target</span>
                       <span style={{ fontSize: '14px', fontWeight: 'bold', color: 'var(--accent-cyan)' }}>{workers} threads</span>
                     </div>
                     <div className="slider-container">
                       <input type="range" className="slider" min="1" max={Math.max(16, maxCpus)} value={workers} onChange={(e) => setWorkers(parseInt(e.target.value))} disabled={isEncoding} />
                     </div>
                     <span style={{ fontSize: '11px', color: 'var(--text-low)', display: 'block', marginTop: '6px' }}>
-                      Spawns parallel instances of avmenc.exe to encode segment chunks, utilizing multiple CPU cores. <strong>Recommended: use all logical processors (default). Selecting fewer workers may cause Windows to aggressively throttle the encoder to E-cores, resulting in extremely slow encoding.</strong>
+                      Targets this many logical CPU threads. The backend will use a small number of AVM processes with multiple threads each to reduce crashes and improve CPU use.
                     </span>
                   </div>
                 </div>

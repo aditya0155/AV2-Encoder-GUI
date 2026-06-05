@@ -9,7 +9,7 @@ import { spawn } from 'child_process';
 import { startEncoding, cancelEncoding, getStatus, resetJobStatus } from './encoder.js';
 
 const app = express();
-const port = 5000;
+const port = parseInt(process.env.PORT, 10) || 5000;
 
 app.use(cors());
 app.use(express.json());
@@ -192,6 +192,55 @@ app.post('/api/reset-status', (req, res) => {
 app.get('/api/status', (req, res) => {
   res.json(getStatus());
 });
+
+function describePortOwner(portToCheck, callback) {
+  if (process.platform !== 'win32') {
+    callback('');
+    return;
+  }
+
+  const script = `
+    $conn = Get-NetTCPConnection -LocalPort ${portToCheck} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($conn) {
+      $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+      if ($proc) {
+        "$($conn.OwningProcess) $($proc.ProcessName) $($proc.Path)"
+      } else {
+        "$($conn.OwningProcess)"
+      }
+    }
+  `;
+  const child = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script]);
+  let stdout = '';
+
+  child.stdout.on('data', (data) => { stdout += data; });
+  child.on('close', () => callback(stdout.trim()));
+  child.on('error', () => callback(''));
+}
+
+let startupErrorHandled = false;
+function handleStartupError(err) {
+  if (startupErrorHandled) return;
+  startupErrorHandled = true;
+
+  if (err.code !== 'EADDRINUSE') {
+    console.error('Backend server failed:', err);
+    process.exitCode = 1;
+    return;
+  }
+
+  describePortOwner(port, (owner) => {
+    console.error(`AV2 GUI Backend could not start because port ${port} is already in use.`);
+    if (owner) {
+      console.error(`Port ${port} owner: ${owner}`);
+    }
+    console.error('Another backend is probably already running. Use that window, or stop the old node.exe process before starting a new backend.');
+    process.exitCode = 1;
+  });
+}
+
+server.on('error', handleStartupError);
+wss.on('error', handleStartupError);
 
 server.listen(port, () => {
   console.log(`AV2 GUI Backend running at http://localhost:${port}`);
