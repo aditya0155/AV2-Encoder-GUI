@@ -181,8 +181,8 @@ if not exist "%ROOT%build\avmenc.exe" (
         "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; " ^
         "$ProgressPreference = 'SilentlyContinue'; " ^
         "try { " ^
-        "  Write-Host '        Downloading from github.com/aditya0155/AV2-GUI-Encoder...'; " ^
-        "  Invoke-WebRequest -Uri 'https://github.com/aditya0155/AV2-GUI-Encoder/releases/latest/download/avmenc.exe' -OutFile '%ROOT%build\avmenc.exe' -UseBasicParsing; " ^
+        "  Write-Host '        Downloading from github.com/aditya0155/AV2-Encoder-GUI...'; " ^
+        "  Invoke-WebRequest -Uri 'https://github.com/aditya0155/AV2-Encoder-GUI/releases/latest/download/avmenc.exe' -OutFile '%ROOT%build\avmenc.exe' -UseBasicParsing; " ^
         "  Write-Host '        avmenc.exe downloaded and installed successfully.'; " ^
         "} catch { " ^
         "  Write-Host '        [WARNING] Failed to download pre-compiled avmenc.exe.'; " ^
