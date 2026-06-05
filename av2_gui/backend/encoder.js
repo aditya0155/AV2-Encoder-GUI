@@ -32,20 +32,45 @@ let tempMuxPath = '';
 let tempListPath = '';
 let activeSegments = [];
 
-export function disableProcessEcoQoS(pid) {
-  if (process.platform !== 'win32') return;
-  const psScript = path.resolve(process.cwd(), 'disable_ecoqos.ps1');
-  if (fs.existsSync(psScript)) {
-    const ps = spawn('powershell.exe', [
-      '-NoProfile',
-      '-ExecutionPolicy', 'Bypass',
-      '-File', psScript,
-      '-targetPid', pid
-    ]);
-    ps.on('error', (err) => {
-      console.error('Failed to run disable_ecoqos.ps1:', err);
-    });
-  }
+// Minimum frames per segment — avmenc only emits progress every ~1 frame but
+// needs enough frames to be observable and to justify process spawn overhead.
+const MIN_FRAMES_PER_SEGMENT = 10;
+
+// Batch-disable EcoQoS/Power Throttling for a list of PIDs in ONE PowerShell
+// call to avoid the overhead of 16 separate JIT compilations.
+function disableEcoQoSForPids(pids) {
+  if (process.platform !== 'win32' || !pids || pids.length === 0) return;
+  const validPids = pids.filter(Boolean);
+  if (validPids.length === 0) return;
+
+  const pidArray = validPids.join(',');
+  const script = `
+$code = @"
+using System;
+using System.Runtime.InteropServices;
+public class ProcessThrottling {
+    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint a, bool b, int c);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] public static extern bool SetProcessInformation(IntPtr h, int c, ref PPTS s, uint l);
+    [StructLayout(LayoutKind.Sequential)] public struct PPTS { public uint Version, ControlMask, StateMask; }
+    public static void Disable(int pid) {
+        var h = OpenProcess(0x200, false, pid);
+        if (h == IntPtr.Zero) return;
+        var s = new PPTS { Version = 1, ControlMask = 1, StateMask = 0 };
+        SetProcessInformation(h, 4, ref s, (uint)System.Runtime.InteropServices.Marshal.SizeOf(s));
+        CloseHandle(h);
+    }
+}
+"@
+Add-Type -TypeDefinition $code -ErrorAction SilentlyContinue
+@(${pidArray}) | ForEach-Object { [ProcessThrottling]::Disable([int]$_) }
+`;
+
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  const ps = spawn('powershell.exe', [
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded
+  ]);
+  ps.on('error', (err) => console.error('EcoQoS batch disable failed:', err.message));
 }
 
 export function getStatus() {
@@ -192,8 +217,15 @@ async function runPipeline({ inputFile, outputFile, qp, speed, audioMode, audioB
     updateJob({ status: 'preparing' });
     
     const parsedWorkers = Math.max(1, parseInt(workers) || os.cpus().length);
-    const numSegments = Math.min(parsedWorkers, jobTotalFrames);
+    // Cap segments so each gets at least MIN_FRAMES_PER_SEGMENT frames.
+    // This prevents avmenc from completing before emitting any progress line,
+    // which would leave the UI stuck at 0%.
+    const maxSegmentsByFrames = Math.max(1, Math.floor(jobTotalFrames / MIN_FRAMES_PER_SEGMENT));
+    const numSegments = Math.min(parsedWorkers, jobTotalFrames, maxSegmentsByFrames);
     const framesPerSegment = Math.floor(jobTotalFrames / numSegments);
+    if (numSegments < parsedWorkers) {
+      addLog(`Note: Reduced workers from ${parsedWorkers} → ${numSegments} to ensure each segment has at least ${MIN_FRAMES_PER_SEGMENT} frames.`);
+    }
     const segments = [];
     let startFrame = 0;
     
@@ -491,7 +523,6 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames) {
         if (os.setPriority) {
           os.setPriority(encoder.pid, os.constants.priority.PRIORITY_ABOVE_NORMAL);
         }
-        disableProcessEcoQoS(encoder.pid);
       } catch (e) {
         console.error(`Failed to set priority for segment ${i}:`, e);
       }
@@ -552,6 +583,10 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames) {
       
       return encoder;
     });
+
+    // Batch-disable EcoQoS for ALL encoder PIDs in a single PowerShell call
+    // (avoids the 16x JIT-compilation overhead of individual calls)
+    disableEcoQoSForPids(encoders.map(e => e.pid));
     
     function updateProgress() {
       if (failed) return;
