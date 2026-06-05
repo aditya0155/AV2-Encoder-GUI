@@ -15,6 +15,7 @@ const AVM_ENC_PATH = fs.existsSync(RELATIVE_AVM_ENC_PATH)
 let activeProcesses = []; // Array of active child processes
 let currentRunId = 0;
 let cancelRequested = false;
+let currentPipelinePromise = Promise.resolve();
 let currentJob = {
   status: 'idle', // 'idle', 'preparing', 'encoding', 'muxing', 'completed', 'failed', 'cancelled'
   progress: 0,
@@ -200,10 +201,6 @@ function cleanupTempFiles({ log = true } = {}) {
 }
 
 export function startEncoding({ inputFile, outputFile, qp, speed, audioMode, audioBitrate, limitFrames, resolutionScale, workers }) {
-  if (currentJob.status === 'preparing' || currentJob.status === 'encoding' || currentJob.status === 'muxing') {
-    return { error: 'Encoding is already in progress.' };
-  }
-
   if (!fs.existsSync(inputFile)) {
     return { error: `Input file does not exist: ${inputFile}` };
   }
@@ -221,44 +218,54 @@ export function startEncoding({ inputFile, outputFile, qp, speed, audioMode, aud
     return { error: `Output directory does not exist: ${outputDir}` };
   }
 
-  currentRunId++;
-  cancelRequested = false;
-  activeProcesses = [];
-  cleanupTempFiles({ log: false });
-  const runId = currentRunId;
-
-  // Initialize job status
-  currentJob = {
-    status: 'preparing',
-    progress: 0,
-    currentFrame: 0,
-    totalFrames: 0,
-    fps: 0,
-    eta: 'N/A',
-    startTime: Date.now(),
-    logs: [],
-    error: null,
-    inputFile,
-    outputFile
-  };
-  broadcast({ type: 'status', status: currentJob });
-
-  addLog(`Starting encoding job:`);
-  addLog(`- Input: ${inputFile}`);
-  addLog(`- Output: ${outputFile}`);
-  addLog(`- Constant Quality (QP): ${qp}`);
-  addLog(`- Speed (CPU Used): ${speed}`);
-  addLog(`- Audio Mode: ${audioMode}`);
-  addLog(`- Audio Bitrate: ${audioBitrate}k`);
-  if (limitFrames > 0) {
-    addLog(`- Frame Limit: ${limitFrames}`);
-  }
-  if (resolutionScale && resolutionScale !== 'original') {
-    addLog(`- Resolution Scale: ${resolutionScale}`);
+  const isRunning = (currentJob.status === 'preparing' || currentJob.status === 'encoding' || currentJob.status === 'muxing');
+  if (isRunning) {
+    addLog('A job is already in progress. Requesting termination of the active job...');
+    cancelEncoding();
   }
 
-  // Run the pipeline
-  runPipeline({ inputFile, outputFile, qp, speed, audioMode, audioBitrate, limitFrames, resolutionScale, workers, runId });
+  currentPipelinePromise = currentPipelinePromise
+    .catch(() => {})
+    .then(() => {
+      currentRunId++;
+      cancelRequested = false;
+      activeProcesses = [];
+      cleanupTempFiles({ log: false });
+      const runId = currentRunId;
+
+      // Initialize job status
+      currentJob = {
+        status: 'preparing',
+        progress: 0,
+        currentFrame: 0,
+        totalFrames: 0,
+        fps: 0,
+        eta: 'N/A',
+        startTime: Date.now(),
+        logs: [],
+        error: null,
+        inputFile,
+        outputFile
+      };
+      broadcast({ type: 'status', status: currentJob });
+
+      addLog(`Starting encoding job:`);
+      addLog(`- Input: ${inputFile}`);
+      addLog(`- Output: ${outputFile}`);
+      addLog(`- Constant Quality (QP): ${qp}`);
+      addLog(`- Speed (CPU Used): ${speed}`);
+      addLog(`- Audio Mode: ${audioMode}`);
+      addLog(`- Audio Bitrate: ${audioBitrate}k`);
+      if (limitFrames > 0) {
+        addLog(`- Frame Limit: ${limitFrames}`);
+      }
+      if (resolutionScale && resolutionScale !== 'original') {
+        addLog(`- Resolution Scale: ${resolutionScale}`);
+      }
+
+      // Run the pipeline and return its promise
+      return runPipeline({ inputFile, outputFile, qp, speed, audioMode, audioBitrate, limitFrames, resolutionScale, workers, runId });
+    });
 
   return { success: true };
 }
