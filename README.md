@@ -17,9 +17,10 @@ A web-based GUI for the **AV2 (AVM) reference video codec** with segment-based p
 ## Quick Start
 
 1. Clone the repo
-2. Double-click **`launch.bat`** (the launcher will automatically download the latest precompiled `avmenc.exe` from releases, or you can place your own custom compiled version in the `build/` folder).
+2. Double-click **`launch.bat`** (the launcher will automatically verify your local `avmenc.exe`, run a fast, non-blocking 1.5-second HEAD check for updates from GitHub releases, and start the servers).
 
-> The launcher auto-downloads **Node.js**, **FFmpeg**, and **avmenc.exe** if missing. First run takes ~2 min.
+> [!TIP]
+> **Zero-Dependency Auto-Setup & Compilation Fallback:** The launcher auto-downloads **Node.js**, **FFmpeg**, and the precompiled **avmenc.exe** if missing. If the precompiled binary download fails (or is not uploaded yet), it automatically starts an automated local builder (`build_encoder.bat`), sets up a clean portable compiler toolchain (WinLibs GCC + CMake + NASM), clones the official AOMedia AV2 (AVM) repository, and builds `avmenc.exe` locally from source using all CPU cores!
 
 ## Features
 
@@ -29,11 +30,15 @@ A web-based GUI for the **AV2 (AVM) reference video codec** with segment-based p
 - **Frame limiter** — encode only first N frames for testing
 - **Audio control** — copy, transcode to Opus, or strip
 - **Native file dialogs** — Windows Open/Save pickers with web fallback
+- **Non-blocking Auto-Updates** — Checks online release version in <1.5s on start; falls back silently to local binary if offline or no updates are found.
 
 ## Project Structure
 
 ```
 build/avmenc.exe          # AV2 encoder binary (auto-downloaded or user-provided)
+build_encoder.bat         # Zero-dependency compiler toolchain & source builder
+tools/
+  check_encoder.ps1       # Non-blocking version checking and updater script
 launch.bat                # One-click launcher (auto-installs deps)
 av2_gui/
   backend/
@@ -58,8 +63,8 @@ Input → FFmpeg decode → N segment .y4m files
 ## Requirements
 
 - **Windows 10+**
-- `avmenc.exe` in `build/` (automatically downloaded by `launch.bat`, or compiled from [AVM source](https://gitlab.com/AOM/avm))
-- Everything else is auto-downloaded by `launch.bat`
+- **Git** (only required if cloning/compiling from source using the local builder fallback)
+- Everything else (Node.js, FFmpeg, compiler toolchain, and `avmenc.exe` binary) is automatically handled by the launcher.
 
 ## Manual Start (Optional)
 
