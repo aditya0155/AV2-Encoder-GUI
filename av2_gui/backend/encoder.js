@@ -44,6 +44,7 @@ const AVM_CRASH_EXIT_CODES = new Set([
   3221225477, // 0xC0000005 access violation, reported by Windows as an unsigned exit code.
   -1073741819
 ]);
+const ENCODER_PROGRESS_LOG_INTERVAL_MS = 10000;
 
 class CancellationError extends Error {
   constructor(message = 'Encoding cancelled') {
@@ -601,7 +602,12 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
     const pendingSegments = [...segments.keys()];
     const runningSegments = new Set();
     const attemptsBySegment = new Array(segments.length).fill(0);
-    const concurrency = Math.max(1, Math.min(segments.length, parseInt(segments.length) || 1));
+    const lastProgressLogAt = new Array(segments.length).fill(0);
+    const concurrency = Math.max(1, segments.length);
+    const logicalCpus = Math.max(1, os.cpus().length);
+    const encoderThreads = Math.max(1, Math.floor(logicalCpus / concurrency));
+    addLog(`Encoder threading: ${concurrency} parallel workers x ${encoderThreads} thread(s) each across ${logicalCpus} logical CPU(s).`);
+
     const progressTimer = setInterval(() => {
       if (!isActiveRun(runId)) {
         settleReject(new CancellationError());
@@ -631,12 +637,6 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
 
     function handleEncoderOutput(i, data, source) {
       const text = data.toString();
-      if (source === 'stdout') {
-        const trimmed = text.trim();
-        if (trimmed) {
-          addLog(`[Segment ${i} stdout] ${trimmed}`);
-        }
-      }
 
       if (!isActiveRun(runId)) {
         settleReject(new CancellationError());
@@ -674,24 +674,38 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
         if (segmentFps[i] === 0 && segmentFramesProcessed[i] > 0) {
           segmentFps[i] = segmentFramesProcessed[i] / elapsedSeconds;
         }
+        maybeLogSegmentProgress(i);
         updateProgress();
       }
     }
 
     function buildEncoderArgs(seg, attempt) {
+      const safeSpeed = Math.min(parseInt(speed) || 9, 8);
+      const threads = attempt === 1
+        ? encoderThreads
+        : (attempt === 2 ? Math.max(1, Math.floor(encoderThreads / 2)) : 1);
       const args = [
         '--disable-warning-prompt',
         `--qp=${qp}`,
-        `--cpu-used=${attempt >= 3 ? Math.min(parseInt(speed) || 9, 8) : speed}`,
+        `--cpu-used=${attempt >= 3 ? safeSpeed : speed}`,
+        `--threads=${threads}`,
       ];
-      if (attempt >= 2) {
-        args.push('--threads=1');
-      }
       if (seg.frames > 0) {
         args.push(`--limit=${seg.frames}`);
       }
       args.push('-o', seg.av2Path, seg.y4mPath);
       return args;
+    }
+
+    function maybeLogSegmentProgress(i) {
+      const now = Date.now();
+      if (now - lastProgressLogAt[i] < ENCODER_PROGRESS_LOG_INTERVAL_MS) return;
+      lastProgressLogAt[i] = now;
+
+      const frames = segmentFramesProcessed[i];
+      const total = segments[i].frames;
+      const fps = segmentFps[i] || 0;
+      addLog(`[Segment ${i}] Progress: ${frames}/${total} frames (${fps.toFixed(2)} fps)`);
     }
 
     function startNextSegments() {
