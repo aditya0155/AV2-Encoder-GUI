@@ -669,6 +669,7 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
 
     for (const [i, seg] of segments.entries()) {
       const args = [
+        '--disable-warning-prompt',
         `--qp=${qp}`,
         `--cpu-used=${speed}`,
       ];
