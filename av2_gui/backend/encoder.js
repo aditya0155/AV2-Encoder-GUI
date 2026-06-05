@@ -39,6 +39,11 @@ let activeSegments = [];
 // Minimum frames per segment — avmenc only emits progress every ~1 frame but
 // needs enough frames to be observable and to justify process spawn overhead.
 const MIN_FRAMES_PER_SEGMENT = 10;
+const MAX_ENCODER_ATTEMPTS = 3;
+const AVM_CRASH_EXIT_CODES = new Set([
+  3221225477, // 0xC0000005 access violation, reported by Windows as an unsigned exit code.
+  -1073741819
+]);
 
 class CancellationError extends Error {
   constructor(message = 'Encoding cancelled') {
@@ -591,13 +596,25 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
     const segmentFramesProcessed = new Array(segments.length).fill(0);
     const segmentFps = new Array(segments.length).fill(0);
     const segmentStartTimes = new Array(segments.length).fill(Date.now());
-    const encoders = [];
+    const segmentPocs = segments.map(() => new Set());
+    const activeEncoders = new Set();
+    const pendingSegments = [...segments.keys()];
+    const runningSegments = new Set();
+    const attemptsBySegment = new Array(segments.length).fill(0);
+    const concurrency = Math.max(1, Math.min(segments.length, parseInt(segments.length) || 1));
+    const progressTimer = setInterval(() => {
+      if (!isActiveRun(runId)) {
+        settleReject(new CancellationError());
+        return;
+      }
+      updateProgress();
+    }, 1000);
 
     const settleReject = (err) => {
       if (settled) return;
       settled = true;
       clearInterval(progressTimer);
-      for (const enc of encoders) {
+      for (const enc of activeEncoders) {
         if (!enc.killed) {
           try { enc.kill('SIGINT'); } catch(e) {}
         }
@@ -613,17 +630,17 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
     };
 
     function handleEncoderOutput(i, data, source) {
-      if (!isActiveRun(runId)) {
-        settleReject(new CancellationError());
-        return;
-      }
-
       const text = data.toString();
       if (source === 'stdout') {
         const trimmed = text.trim();
         if (trimmed) {
           addLog(`[Segment ${i} stdout] ${trimmed}`);
         }
+      }
+
+      if (!isActiveRun(runId)) {
+        settleReject(new CancellationError());
+        return;
       }
 
       let updated = false;
@@ -644,8 +661,10 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
 
       const pocMatches = [...text.matchAll(/POC:\s*(\d+)/g)];
       if (pocMatches.length > 0) {
-        const maxPoc = Math.max(...pocMatches.map(match => parseInt(match[1])));
-        const currentFrame = Math.min(maxPoc + 1, segments[i].frames);
+        for (const match of pocMatches) {
+          segmentPocs[i].add(parseInt(match[1]));
+        }
+        const currentFrame = Math.min(segmentPocs[i].size, segments[i].frames);
         segmentFramesProcessed[i] = Math.max(segmentFramesProcessed[i], currentFrame);
         updated = true;
       }
@@ -659,29 +678,90 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
       }
     }
 
-    const progressTimer = setInterval(() => {
-      if (!isActiveRun(runId)) {
-        settleReject(new CancellationError());
-        return;
-      }
-      updateProgress();
-    }, 1000);
-
-    for (const [i, seg] of segments.entries()) {
+    function buildEncoderArgs(seg, attempt) {
       const args = [
         '--disable-warning-prompt',
         `--qp=${qp}`,
-        `--cpu-used=${speed}`,
+        `--cpu-used=${attempt >= 3 ? Math.min(parseInt(speed) || 9, 8) : speed}`,
       ];
+      if (attempt >= 2) {
+        args.push('--threads=1');
+      }
       if (seg.frames > 0) {
         args.push(`--limit=${seg.frames}`);
       }
       args.push('-o', seg.av2Path, seg.y4mPath);
+      return args;
+    }
 
-      addLog(`[Segment ${i}] Running: ${AVM_ENC_PATH} ${args.join(' ')}`);
+    function startNextSegments() {
+      if (settled) return;
+      if (!isActiveRun(runId)) {
+        settleReject(new CancellationError());
+        return;
+      }
+
+      while (runningSegments.size < concurrency && pendingSegments.length > 0) {
+        const i = pendingSegments.shift();
+        runSegmentAttempt(i);
+      }
+
+      if (completedCount === segments.length) {
+        settleResolve();
+      }
+    }
+
+    function retryOrFailSegment(i, code, stderrTail, stdoutTail) {
+      const seg = segments[i];
+      runningSegments.delete(i);
+      const attempt = attemptsBySegment[i];
+      const canRetry = attempt < MAX_ENCODER_ATTEMPTS;
+
+      if (canRetry) {
+        const crashNote = AVM_CRASH_EXIT_CODES.has(code) ? 'access violation' : `exit code ${code}`;
+        addLog(`[Segment ${i}] avmenc.exe failed with ${crashNote}; retrying attempt ${attempt + 1}/${MAX_ENCODER_ATTEMPTS} with safer settings...`);
+        if (stdoutTail) addLog(`[Segment ${i}] stdout tail before retry: ${stdoutTail}`);
+        if (stderrTail) addLog(`[Segment ${i}] stderr tail before retry: ${stderrTail}`);
+        try {
+          if (fs.existsSync(seg.av2Path)) {
+            fs.unlinkSync(seg.av2Path);
+          }
+        } catch(e) {}
+        segmentFramesProcessed[i] = 0;
+        segmentFps[i] = 0;
+        segmentPocs[i].clear();
+        pendingSegments.unshift(i);
+        startNextSegments();
+        return;
+      }
+
+      const details = [
+        `Segment ${i} avmenc.exe failed after ${attempt} attempts with exit code ${code}`,
+        stdoutTail ? `stdout tail: ${stdoutTail}` : '',
+        stderrTail ? `stderr tail: ${stderrTail}` : ''
+      ].filter(Boolean).join(' | ');
+      settleReject(new Error(details));
+    }
+
+    function runSegmentAttempt(i) {
+      const seg = segments[i];
+      runningSegments.add(i);
+      attemptsBySegment[i]++;
+      segmentStartTimes[i] = Date.now();
+      let stdoutTail = '';
+      let stderrTail = '';
+
+      const attempt = attemptsBySegment[i];
+      const args = buildEncoderArgs(seg, attempt);
+
+      if (attempt > 1) {
+        addLog(`[Segment ${i}] Retry attempt ${attempt}/${MAX_ENCODER_ATTEMPTS}: ${AVM_ENC_PATH} ${args.join(' ')}`);
+      } else {
+        addLog(`[Segment ${i}] Running: ${AVM_ENC_PATH} ${args.join(' ')}`);
+      }
 
       const encoder = spawn(AVM_ENC_PATH, args);
-      encoders.push(encoder);
+      activeEncoders.add(encoder);
       activeProcesses.push(encoder);
 
       try {
@@ -692,46 +772,56 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
         console.error(`Failed to set priority for segment ${i}:`, e);
       }
 
-      encoder.stderr.on('data', (data) => handleEncoderOutput(i, data, 'stderr'));
-      encoder.stdout.on('data', (data) => handleEncoderOutput(i, data, 'stdout'));
+      encoder.stderr.on('data', (data) => {
+        stderrTail = (stderrTail + data.toString()).slice(-2000);
+        handleEncoderOutput(i, data, 'stderr');
+      });
+      encoder.stdout.on('data', (data) => {
+        stdoutTail = (stdoutTail + data.toString()).slice(-2000);
+        handleEncoderOutput(i, data, 'stdout');
+      });
 
       encoder.on('close', (code) => {
         activeProcesses = activeProcesses.filter(p => p !== encoder);
+        activeEncoders.delete(encoder);
 
+        if (settled) return;
         if (!isActiveRun(runId)) {
           settleReject(new CancellationError());
           return;
         }
 
         if (code !== 0) {
-          settleReject(new Error(`Segment ${i} avmenc.exe failed with exit code ${code}`));
+          retryOrFailSegment(i, code, stderrTail.trim(), stdoutTail.trim());
           return;
         }
 
         if (!fs.existsSync(seg.av2Path) || fs.statSync(seg.av2Path).size === 0) {
-          settleReject(new Error(`Segment ${i} encoder output is missing or empty`));
+          retryOrFailSegment(i, 'missing-output', stderrTail.trim(), stdoutTail.trim());
           return;
         }
 
+        runningSegments.delete(i);
         segmentFramesProcessed[i] = seg.frames;
         const elapsedSeconds = Math.max((Date.now() - segmentStartTimes[i]) / 1000, 0.001);
         segmentFps[i] = seg.frames / elapsedSeconds;
         completedCount++;
         updateProgress();
-
-        if (completedCount === segments.length) {
-          settleResolve();
-        }
+        startNextSegments();
       });
 
       encoder.on('error', (err) => {
         activeProcesses = activeProcesses.filter(p => p !== encoder);
+        activeEncoders.delete(encoder);
+        runningSegments.delete(i);
         settleReject(new Error(`Segment ${i} avmenc.exe failed to start: ${err.message}`));
       });
     }
 
-    // Batch-disable EcoQoS for ALL encoder PIDs in a single PowerShell call.
-    disableEcoQoSForPids(encoders.map(e => e.pid));
+    startNextSegments();
+
+    // Batch-disable EcoQoS for encoder PIDs shortly after startup.
+    setTimeout(() => disableEcoQoSForPids([...activeEncoders].map(e => e.pid)), 250);
 
     function updateProgress() {
       if (settled && completedCount !== segments.length) return;
