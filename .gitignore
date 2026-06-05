@@ -1,0 +1,36 @@
+# Dependencies
+av2_gui/backend/node_modules/
+av2_gui/frontend/node_modules/
+
+# Portable tools (auto-downloaded by launch.bat)
+tools/
+
+# AVM source code (users compile separately)
+avm/
+
+# CMake install directories
+bin/
+doc/
+man/
+share/
+
+# Build artifacts (keep encoder binaries only)
+build/*
+!build/avmenc.exe
+!build/avmdec.exe
+
+# Frontend build output
+av2_gui/frontend/dist/
+
+# Test scripts
+av2_gui/test_*.js
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editor files
+*.swp
+*.swo
+*~

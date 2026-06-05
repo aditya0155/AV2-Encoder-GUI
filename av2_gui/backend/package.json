@@ -1,0 +1,15 @@
+{
+  "name": "av2-gui-backend",
+  "version": "1.0.0",
+  "description": "Local backend server for AV2 Transcoder GUI",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}
