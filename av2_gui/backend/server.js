@@ -65,10 +65,15 @@ app.post('/api/select-input-file', (req, res) => {
     $f = New-Object System.Windows.Forms.OpenFileDialog
     $f.Filter = "Video Files (*.mp4;*.mkv;*.avi;*.mov;*.y4m;*.yuv)|*.mp4;*.mkv;*.avi;*.mov;*.y4m;*.yuv|All Files (*.*)|*.*"
     $f.Title = "Select Input Video"
-    $result = $f.ShowDialog()
+    $w = New-Object System.Windows.Forms.Form
+    $w.TopMost = $true
+    $w.ShowInTaskbar = $false
+    $w.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
+    $result = $f.ShowDialog($w)
     if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
       $f.FileName
     }
+    $w.Dispose()
   `;
 
   runPowerShellDialog(psScript, (err, filePath) => {
@@ -88,10 +93,15 @@ app.post('/api/select-output-file', (req, res) => {
     $f.Filter = "WebM Video (*.webm)|*.webm|Matroska Video (*.mkv)|*.mkv"
     $f.Title = "Save Encoded Video As"
     $f.FileName = "output.webm"
-    $result = $f.ShowDialog()
+    $w = New-Object System.Windows.Forms.Form
+    $w.TopMost = $true
+    $w.ShowInTaskbar = $false
+    $w.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
+    $result = $f.ShowDialog($w)
     if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
       $f.FileName
     }
+    $w.Dispose()
   `;
 
   runPowerShellDialog(psScript, (err, filePath) => {
