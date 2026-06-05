@@ -190,23 +190,14 @@ function getEncoderTileArgs(width, height, threads) {
   if (threads <= 1) return ['--row-mt=1'];
 
   const maxColsLog = width >= 1920 ? 2 : (width >= 854 ? 1 : 0);
-  const maxRowsLog = height >= 480 ? 1 : 0;
   let colsLog = 0;
-  let rowsLog = 0;
 
-  while ((1 << (colsLog + rowsLog)) < threads && (colsLog < maxColsLog || rowsLog < maxRowsLog)) {
-    if (colsLog < maxColsLog && (colsLog <= rowsLog || rowsLog >= maxRowsLog)) {
-      colsLog++;
-    } else if (rowsLog < maxRowsLog) {
-      rowsLog++;
-    } else {
-      break;
-    }
+  while ((1 << colsLog) < threads && colsLog < maxColsLog) {
+    colsLog++;
   }
 
   const args = ['--row-mt=1'];
   if (colsLog > 0) args.push(`--tile-columns=${colsLog}`);
-  if (rowsLog > 0) args.push(`--tile-rows=${rowsLog}`);
   return args;
 }
 
@@ -798,6 +789,10 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
         `--qp=${qpValue}`,
         `--cpu-used=${attempt >= 3 ? safeSpeed : speedValue}`,
         `--threads=${threads}`,
+        '--auto-alt-ref=0',
+        '--enable-keyframe-filtering=0',
+        '--enable-overlay=0',
+        '--monotonic-output-order=1',
         ...getEncoderTileArgs(seg.width || 0, seg.height || 0, threads),
       ];
       if (seg.frames > 0) {
