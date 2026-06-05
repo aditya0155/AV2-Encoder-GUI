@@ -17,10 +17,9 @@ A web-based GUI for the **AV2 (AVM) reference video codec** with segment-based p
 ## Quick Start
 
 1. Clone the repo
-2. Place your compiled `avmenc.exe` in the `build/` folder
-3. Double-click **`launch.bat`**
+2. Double-click **`launch.bat`** (the launcher will automatically download the latest precompiled `avmenc.exe` from releases, or you can place your own custom compiled version in the `build/` folder).
 
-> The launcher auto-downloads **Node.js** and **FFmpeg** if missing. First run takes ~2 min.
+> The launcher auto-downloads **Node.js**, **FFmpeg**, and **avmenc.exe** if missing. First run takes ~2 min.
 
 ## Features
 
@@ -34,7 +33,7 @@ A web-based GUI for the **AV2 (AVM) reference video codec** with segment-based p
 ## Project Structure
 
 ```
-build/avmenc.exe          # AV2 encoder binary (you provide this)
+build/avmenc.exe          # AV2 encoder binary (auto-downloaded or user-provided)
 launch.bat                # One-click launcher (auto-installs deps)
 av2_gui/
   backend/
@@ -59,7 +58,7 @@ Input → FFmpeg decode → N segment .y4m files
 ## Requirements
 
 - **Windows 10+**
-- `avmenc.exe` in `build/` (compile from [AVM source](https://gitlab.com/AOM/avm))
+- `avmenc.exe` in `build/` (automatically downloaded by `launch.bat`, or compiled from [AVM source](https://gitlab.com/AOM/avm))
 - Everything else is auto-downloaded by `launch.bat`
 
 ## Manual Start (Optional)

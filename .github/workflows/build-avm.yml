@@ -1,0 +1,45 @@
+name: Build AV2 Reference Encoder
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Clone AVM Repository
+        run: |
+          git clone --depth 1 https://github.com/AOMediaCodec/avm.git
+
+      - name: Configure CMake
+        run: |
+          cmake -S avm -B avm/build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DENABLE_DOCS=OFF -DENABLE_TESTS=OFF
+
+      - name: Build avmenc
+        run: |
+          cmake --build avm/build --config Release --target avmenc
+
+      - name: Upload Artifact to Run
+        uses: actions/upload-artifact@v4
+        with:
+          name: avmenc-windows
+          path: avm/build/Release/avmenc.exe
+
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: avm/build/Release/avmenc.exe

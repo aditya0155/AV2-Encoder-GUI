@@ -50,9 +50,9 @@ powershell -NoProfile -Command ^
     "  Copy-Item -Path (Join-Path $src.FullName '*') -Destination '%ROOT%tools\node' -Recurse -Force; " ^
     "  Remove-Item '%ROOT%tools\node_temp' -Recurse -Force; " ^
     "  Remove-Item '%ROOT%tools\node_download.zip' -Force; " ^
-    "  Write-Host '        Node.js installed successfully!'; " ^
+    "  Write-Host '        Node.js installed successfully.'; " ^
     "} catch { " ^
-    "  Write-Host '[ERROR] Failed to download Node.js: ' + $_.Exception.Message; " ^
+    "  Write-Host ('        [ERROR] Failed to download Node.js: ' + $_.Exception.Message); " ^
     "  exit 1; " ^
     "}"
 
@@ -115,9 +115,9 @@ powershell -NoProfile -Command ^
     "  Copy-Item -Path (Join-Path $binDir.FullName '*') -Destination '%ROOT%tools\ffmpeg' -Recurse -Force; " ^
     "  Remove-Item '%ROOT%tools\ffmpeg_temp' -Recurse -Force; " ^
     "  Remove-Item '%ROOT%tools\ffmpeg_download.zip' -Force; " ^
-    "  Write-Host '        FFmpeg installed successfully!'; " ^
+    "  Write-Host '        FFmpeg installed successfully.'; " ^
     "} catch { " ^
-    "  Write-Host '[ERROR] Failed to download FFmpeg: ' + $_.Exception.Message; " ^
+    "  Write-Host ('        [ERROR] Failed to download FFmpeg: ' + $_.Exception.Message); " ^
     "  exit 1; " ^
     "}"
 
@@ -170,15 +170,36 @@ if not exist "%ROOT%av2_gui\frontend\node_modules\" (
 echo [4/4] Checking AV2 encoder binary...
 
 if not exist "%ROOT%build\avmenc.exe" (
+    echo        avmenc.exe not found in build\ folder.
+    echo        Attempting to download precompiled avmenc.exe from GitHub...
+    echo        (This is a one-time download from the latest project release, ~10 MB)
     echo.
-    echo [WARNING] avmenc.exe not found in build\ folder!
-    echo           The AV2 encoder binary must be compiled from source.
-    echo           See: https://gitlab.com/AOMediaCodec/avm
-    echo           Place the compiled avmenc.exe in the build\ folder.
-    echo.
-    echo           The GUI will launch but encoding will fail without it.
-    echo.
-    pause
+    
+    if not exist "%ROOT%build" mkdir "%ROOT%build"
+    
+    powershell -NoProfile -Command ^
+        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; " ^
+        "$ProgressPreference = 'SilentlyContinue'; " ^
+        "try { " ^
+        "  Write-Host '        Downloading from github.com/aditya0155/AV2-GUI-Encoder...'; " ^
+        "  Invoke-WebRequest -Uri 'https://github.com/aditya0155/AV2-GUI-Encoder/releases/latest/download/avmenc.exe' -OutFile '%ROOT%build\avmenc.exe' -UseBasicParsing; " ^
+        "  Write-Host '        avmenc.exe downloaded and installed successfully.'; " ^
+        "} catch { " ^
+        "  Write-Host '        [WARNING] Failed to download pre-compiled avmenc.exe.'; " ^
+        "  Write-Host ('        Error detail: ' + $_.Exception.Message); " ^
+        "  exit 1; " ^
+        "}"
+        
+    if !errorlevel! neq 0 (
+        echo.
+        echo [WARNING] Automatic avmenc.exe download failed or no release is available yet.
+        echo           You can compile it manually from source: https://gitlab.com/AOMediaCodec/avm
+        echo           And place the compiled avmenc.exe in the build\ folder.
+        echo.
+        echo           The GUI will launch now, but encoding will fail until avmenc.exe is present.
+        echo.
+        pause
+    )
 ) else (
     echo        avmenc.exe found in build\ folder.
 )
