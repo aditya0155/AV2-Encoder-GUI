@@ -553,17 +553,14 @@ export default function App() {
                     </span>
                   </div>
 
-                  {/* Parallel Workers Slider */}
+                  {/* Parallel Workers Label */}
                   <div className="form-group" style={{ marginTop: '20px', marginBottom: 0 }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-                      <span className="form-label" style={{ margin: 0 }}>CPU Thread Target</span>
-                      <span style={{ fontSize: '14px', fontWeight: 'bold', color: 'var(--accent-cyan)' }}>{workers} threads</span>
-                    </div>
-                    <div className="slider-container">
-                      <input type="range" className="slider" min="1" max={Math.max(16, maxCpus)} value={workers} onChange={(e) => setWorkers(parseInt(e.target.value))} disabled={isEncoding} />
+                      <span className="form-label" style={{ margin: 0 }}>CPU Thread Mode</span>
+                      <span style={{ fontSize: '14px', fontWeight: 'bold', color: 'var(--text-low)' }}>Single-threaded (Stable)</span>
                     </div>
                     <span style={{ fontSize: '11px', color: 'var(--text-low)', display: 'block', marginTop: '6px' }}>
-                      Targets this many logical CPU threads. The backend will use a small number of AVM processes with multiple threads each to reduce crashes and improve CPU use.
+                      The encoder is run sequentially as a single process/thread to ensure maximum stability and video quality with the reference AVM software.
                     </span>
                   </div>
                 </div>

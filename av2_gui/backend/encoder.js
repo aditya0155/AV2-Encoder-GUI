@@ -33,17 +33,11 @@ let currentJob = {
 let tempY4MPath = '';
 let tempAV2Path = '';
 let tempMuxPath = '';
-let tempListPath = '';
-let activeSegments = [];
 
-// AVM's Windows encoder build has unstable internal threading/GF paths. Use
-// short all-keyframe chunks and fill the CPU with external process parallelism.
-const TARGET_FRAMES_PER_SEGMENT = 12;
 const MAX_ENCODER_ATTEMPTS = 4;
 const SAFE_AVM_MAX_WIDTH = 854;
 const ENCODER_STALL_TIMEOUT_MS = 30000;
 const ENCODER_ABSOLUTE_TIMEOUT_MS = 4 * 60 * 1000;
-const MAX_ENCODER_CONCURRENCY = 32;
 const AVM_CRASH_EXIT_CODES = new Set([
   3221225477, // 0xC0000005 access violation, reported by Windows as an unsigned exit code.
   -1073741819
@@ -152,26 +146,6 @@ function clampInt(value, min, max, fallback) {
   return Math.max(min, Math.min(max, parsed));
 }
 
-function getScaledDimensions(videoInfo, resolutionScale) {
-  const sourceWidth = parseInt(videoInfo.width, 10) || 0;
-  const sourceHeight = parseInt(videoInfo.height, 10) || 0;
-  const scaleWidths = {
-    '1080p': 1920,
-    '720p': 1280,
-    '480p': 854,
-    '360p': 640,
-    '240p': 426
-  };
-
-  const targetWidth = scaleWidths[resolutionScale] || sourceWidth;
-  if (!targetWidth || !sourceWidth || !sourceHeight) {
-    return { width: sourceWidth, height: sourceHeight };
-  }
-
-  const scaledHeight = Math.max(2, Math.round((sourceHeight * targetWidth / sourceWidth) / 2) * 2);
-  return { width: targetWidth, height: scaledHeight };
-}
-
 function chooseEffectiveResolutionScale(videoInfo, requestedScale) {
   const sourceWidth = parseInt(videoInfo.width, 10) || 0;
   if (requestedScale && requestedScale !== 'original') return requestedScale;
@@ -179,21 +153,6 @@ function chooseEffectiveResolutionScale(videoInfo, requestedScale) {
   return 'original';
 }
 
-function planParallelism(totalFrames, requestedWorkers) {
-  const logicalCpus = Math.max(1, os.cpus().length);
-  const targetCpuThreads = clampInt(requestedWorkers, 1, logicalCpus, logicalCpus);
-  const numSegments = Math.max(1, Math.ceil(totalFrames / TARGET_FRAMES_PER_SEGMENT));
-  const encoderConcurrency = Math.max(1, Math.min(targetCpuThreads * 2, MAX_ENCODER_CONCURRENCY, numSegments));
-
-  return {
-    logicalCpus,
-    targetCpuThreads,
-    numSegments,
-    encoderConcurrency,
-    threadsPerEncoder: 1,
-    actualCpuThreads: encoderConcurrency
-  };
-}
 
 export function cancelEncoding() {
   cancelRequested = true;
@@ -235,35 +194,9 @@ function cleanupTempFiles({ log = true } = {}) {
   if (tempMuxPath && fs.existsSync(tempMuxPath)) {
     try { fs.unlinkSync(tempMuxPath); } catch(e) {}
   }
-  if (tempListPath && fs.existsSync(tempListPath)) {
-    try { fs.unlinkSync(tempListPath); } catch(e) {}
-  }
-  // Clean up segments
-  for (const seg of activeSegments) {
-    if (seg.y4mPath && fs.existsSync(seg.y4mPath)) {
-      try { fs.unlinkSync(seg.y4mPath); } catch(e) {}
-    }
-    if (seg.av2Path && fs.existsSync(seg.av2Path)) {
-      try { fs.unlinkSync(seg.av2Path); } catch(e) {}
-    }
-  }
-  activeSegments = [];
-  tempListPath = '';
-}
-
-function finishWriteStreams(streams) {
-  return Promise.all(streams.map(stream => new Promise(resolve => {
-    if (stream.destroyed || stream.writableFinished) {
-      resolve();
-      return;
-    }
-
-    stream.once('finish', resolve);
-    stream.once('error', resolve);
-    if (!stream.writableEnded) {
-      stream.end();
-    }
-  })));
+  tempY4MPath = '';
+  tempAV2Path = '';
+  tempMuxPath = '';
 }
 
 export function startEncoding({ inputFile, outputFile, qp, speed, audioMode, audioBitrate, limitFrames, resolutionScale, workers }) {
@@ -317,7 +250,6 @@ export function startEncoding({ inputFile, outputFile, qp, speed, audioMode, aud
   addLog(`- Speed (CPU Used): ${speed}`);
   addLog(`- Audio Mode: ${audioMode}`);
   addLog(`- Audio Bitrate: ${audioBitrate}k`);
-  addLog(`- Target Parallel Workers: ${workers || 'Auto'}`);
   if (limitFrames > 0) {
     addLog(`- Frame Limit: ${limitFrames}`);
   }
@@ -344,81 +276,46 @@ async function runPipeline({ inputFile, outputFile, qp, speed, audioMode, audioB
       addLog(`- Encoding limited to first ${parsedLimit} frames.`);
     }
 
-    // Step 2: Slicing into segments
+    // Step 2: Convert/scale to raw Y4M
     updateJob({ status: 'preparing' });
     
     const effectiveResolutionScale = chooseEffectiveResolutionScale(videoInfo, resolutionScale);
     if (effectiveResolutionScale !== resolutionScale) {
-      addLog(`Reference-safe mode: downscaling ${videoInfo.width}x${videoInfo.height} input to ${effectiveResolutionScale} for AVM stability and CPU utilization.`);
+      addLog(`Reference-safe mode: downscaling ${videoInfo.width}x${videoInfo.height} input to ${effectiveResolutionScale} for AVM stability.`);
     }
-    const parallelism = planParallelism(jobTotalFrames, workers);
-    const outputDimensions = getScaledDimensions(videoInfo, effectiveResolutionScale);
-    const numSegments = parallelism.numSegments;
-    const framesPerSegment = Math.floor(jobTotalFrames / numSegments);
-    if (parallelism.targetCpuThreads < (parseInt(workers, 10) || parallelism.logicalCpus)) {
-      addLog(`Note: Capped requested CPU threads at ${parallelism.targetCpuThreads}, matching available logical CPUs.`);
-    }
-    addLog(`Planned ${numSegments} short segment(s), running up to ${parallelism.encoderConcurrency} single-threaded encoder process(es) at once.`);
-    const segments = [];
-    let startFrame = 0;
     
     const fileDir = path.dirname(outputFile);
     const fileBaseName = path.basename(outputFile, path.extname(outputFile));
     
-    for (let i = 0; i < numSegments; i++) {
-      const isLast = (i === numSegments - 1);
-      const endFrame = isLast ? jobTotalFrames : (startFrame + framesPerSegment);
-      const segmentFrames = endFrame - startFrame;
-      
-      segments.push({
-        index: i,
-        startFrame,
-        endFrame,
-        frames: segmentFrames,
-        width: outputDimensions.width,
-        height: outputDimensions.height,
-        y4mPath: path.join(fileDir, `${fileBaseName}_temp_seg${i}.y4m`),
-        av2Path: path.join(fileDir, `${fileBaseName}_temp_seg${i}.av2`)
-      });
-      startFrame = endFrame;
-    }
+    tempY4MPath = path.join(fileDir, `${fileBaseName}_temp.y4m`);
+    tempAV2Path = path.join(fileDir, `${fileBaseName}_temp.av2`);
     
-    activeSegments = segments;
-    
-    addLog(`Step 1/3: Splitting video into ${numSegments} segments in parallel...`);
-    await splitVideoIntoSegments(inputFile, segments, effectiveResolutionScale, jobTotalFrames, runId);
+    addLog(`Step 1/3: Converting input video to raw Y4M...`);
+    await convertVideoToY4M(inputFile, tempY4MPath, effectiveResolutionScale, jobTotalFrames, runId);
     throwIfCancelled(runId);
-    addLog('Video split complete.');
+    addLog('Video conversion to Y4M complete.');
 
-    // Step 3: Run the parallel AV2 encoders
+    // Step 3: Run the AV2 encoder
     updateJob({ status: 'encoding' });
-    addLog(`Step 2/3: Encoding ${numSegments} video segments in parallel using all cores...`);
-    await runParallelAV2Encoders(segments, qp, speed, jobTotalFrames, runId, parallelism);
+    addLog(`Step 2/3: Encoding video with AVM...`);
+    await runAV2Encoder(tempY4MPath, tempAV2Path, qp, speed, jobTotalFrames, runId);
     throwIfCancelled(runId);
-    addLog('AV2 parallel encoding complete.');
+    addLog('AV2 encoding complete.');
 
-    // Step 4: Patch, Concat, and Mux audio/video together
+    // Step 4: Patch, Mux, and restore codec metadata
     updateJob({ status: 'muxing' });
-    addLog('Step 3/3: Patching and concatenating segments with audio...');
+    addLog('Step 3/3: Patching and muxing audio...');
     
-    // Patch all segment AV2 WebM files to V_FFV1 to bypass FFmpeg parser blocks
-    for (const seg of segments) {
-      throwIfCancelled(runId);
-      addLog(`Patching segment ${seg.index} temporary file to V_FFV1...`);
-      patchWebMToFFV1(seg.av2Path);
-    }
-    
-    // Write tempListPath
-    tempListPath = path.join(fileDir, `${fileBaseName}_temp_list.txt`);
-    const listContent = segments.map(seg => `file '${seg.av2Path.replace(/\\/g, '/')}'`).join('\n');
-    fs.writeFileSync(tempListPath, listContent);
+    // Patch AV2 WebM file to V_FFV1 to bypass FFmpeg parser blocks
+    addLog(`Patching temporary AV2 file to V_FFV1...`);
+    patchWebMToFFV1(tempAV2Path);
     
     // Determine target formats
     const isWebM = outputFile.toLowerCase().endsWith('.webm');
     tempMuxPath = isWebM ? outputFile.replace(/\.webm$/i, '_temp_mux.mkv') : outputFile;
     
-    await muxSegmentsWithAudio({
-      listPath: tempListPath,
+    await muxWithAudio({
+      videoPath: tempAV2Path,
       sourcePath: inputFile,
       outputPath: tempMuxPath,
       audioMode,
@@ -441,7 +338,7 @@ async function runPipeline({ inputFile, outputFile, qp, speed, audioMode, audioB
       fs.renameSync(tempMuxPath, outputFile);
     }
     
-    addLog('Concatenation and muxing complete.');
+    addLog('Muxing complete.');
 
     // Done!
     cleanupTempFiles();
@@ -501,7 +398,7 @@ function probeVideo(filePath) {
           if (!isNaN(duration) && !isNaN(fps)) {
             totalFrames = Math.round(duration * fps);
           } else {
-            totalFrames = 300; // Fallback estimate (10 seconds @ 30 FPS)
+            totalFrames = 300; // Fallback estimate
           }
         }
 
@@ -522,21 +419,9 @@ function probeVideo(filePath) {
   });
 }
 
-// Spawns ffmpeg to convert to Y4M stream and split it into segment files
-function splitVideoIntoSegments(inputFile, segments, resolutionScale, limitFrames, runId) {
+// Spawns ffmpeg to convert/scale video to a single Y4M file
+function convertVideoToY4M(inputFile, outputPath, resolutionScale, limitFrames, runId) {
   return new Promise((resolve, reject) => {
-    let settled = false;
-    const settleResolve = () => {
-      if (settled) return;
-      settled = true;
-      resolve();
-    };
-    const settleReject = (err) => {
-      if (settled) return;
-      settled = true;
-      reject(err);
-    };
-
     const args = ['-y', '-i', inputFile];
     
     if (resolutionScale && resolutionScale !== 'original') {
@@ -556,8 +441,9 @@ function splitVideoIntoSegments(inputFile, segments, resolutionScale, limitFrame
     if (limitFrames > 0) {
       args.push('-vframes', limitFrames.toString());
     }
-    args.push('-f', 'yuv4mpegpipe', '-');
+    args.push(outputPath);
 
+    addLog(`Running: ffmpeg ${args.join(' ')}`);
     const ffmpeg = spawn('ffmpeg', args);
     activeProcesses.push(ffmpeg);
 
@@ -567,81 +453,8 @@ function splitVideoIntoSegments(inputFile, segments, resolutionScale, limitFrame
       }
       disableProcessEcoQoS(ffmpeg.pid);
     } catch (e) {
-      console.error('Failed to set priority for FFmpeg split:', e);
+      console.error('Failed to set priority for FFmpeg Y4M conversion:', e);
     }
-    
-    let parsedHeader = false;
-    let framePayloadSize = 0;
-    let currentSegmentIndex = 0;
-    let buffer = Buffer.alloc(0);
-    
-    const writeStreams = segments.map(seg => fs.createWriteStream(seg.y4mPath));
-    
-    ffmpeg.stdout.on('data', (chunk) => {
-      if (!isActiveRun(runId)) {
-        try { ffmpeg.kill('SIGINT'); } catch(e) {}
-        return;
-      }
-
-      buffer = Buffer.concat([buffer, chunk]);
-      
-      if (!parsedHeader) {
-        const newlineIndex = buffer.indexOf(0x0a);
-        if (newlineIndex !== -1) {
-          const headerBytes = buffer.slice(0, newlineIndex + 1);
-          const headerStr = headerBytes.toString('utf8');
-          
-          const widthMatch = headerStr.match(/W(\d+)/);
-          const heightMatch = headerStr.match(/H(\d+)/);
-          if (!widthMatch || !heightMatch) {
-            ffmpeg.kill('SIGINT');
-            settleReject(new Error('Invalid Y4M header format from FFmpeg'));
-            return;
-          }
-          
-          const width = parseInt(widthMatch[1]);
-          const height = parseInt(heightMatch[1]);
-          framePayloadSize = Math.floor(width * height * 1.5);
-          
-          // Write Y4M header to each segment file
-          for (let i = 0; i < segments.length; i++) {
-            writeStreams[i].write(headerBytes);
-          }
-          
-          buffer = buffer.slice(newlineIndex + 1);
-          parsedHeader = true;
-        }
-      }
-      
-      if (parsedHeader) {
-        while (true) {
-          const frameHeaderEnd = buffer.indexOf(0x0a);
-          if (frameHeaderEnd === -1) break;
-
-          const frameHeader = buffer.slice(0, frameHeaderEnd + 1);
-          if (!frameHeader.toString('ascii').startsWith('FRAME')) {
-            try { ffmpeg.kill('SIGINT'); } catch(e) {}
-            settleReject(new Error('Invalid Y4M frame header from FFmpeg'));
-            return;
-          }
-
-          const frameSize = frameHeaderEnd + 1 + framePayloadSize;
-          if (buffer.length < frameSize) break;
-
-          const frameBytes = buffer.slice(0, frameSize);
-          buffer = buffer.slice(frameSize);
-          
-          const activeSeg = segments[currentSegmentIndex];
-          writeStreams[currentSegmentIndex].write(frameBytes);
-          
-          activeSeg.writtenFrames = (activeSeg.writtenFrames || 0) + 1;
-          if (activeSeg.writtenFrames >= activeSeg.frames && currentSegmentIndex < segments.length - 1) {
-            writeStreams[currentSegmentIndex].end();
-            currentSegmentIndex++;
-          }
-        }
-      }
-    });
 
     ffmpeg.stderr.on('data', (data) => {
       const text = data.toString().trim();
@@ -656,69 +469,41 @@ function splitVideoIntoSegments(inputFile, segments, resolutionScale, limitFrame
 
     ffmpeg.on('close', (code) => {
       activeProcesses = activeProcesses.filter(p => p !== ffmpeg);
-      finishWriteStreams(writeStreams).then(() => {
-        if (!isActiveRun(runId)) {
-          settleReject(new CancellationError());
-          return;
-        }
-        if (code === 0) {
-          const shortSegment = segments.find(seg => (seg.writtenFrames || 0) !== seg.frames);
-          if (shortSegment) {
-            settleReject(new Error(`FFmpeg split wrote ${shortSegment.writtenFrames || 0}/${shortSegment.frames} frames for segment ${shortSegment.index}`));
-            return;
-          }
-          settleResolve();
-        } else {
-          settleReject(new Error(`FFmpeg split failed with exit code ${code}`));
-        }
-      });
+      if (!isActiveRun(runId)) {
+        reject(new CancellationError());
+      } else if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`FFmpeg split failed with exit code ${code}`));
+      }
     });
-    
+
     ffmpeg.on('error', (err) => {
       activeProcesses = activeProcesses.filter(p => p !== ffmpeg);
-      finishWriteStreams(writeStreams).finally(() => settleReject(err));
+      reject(err);
     });
   });
 }
 
-// Spawns multiple avmenc.exe instances in parallel and aggregates progress.
-function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, parallelism) {
+// Spawns single avmenc.exe process to encode the Y4M file
+function runAV2Encoder(y4mPath, av2Path, qp, speed, totalFrames, runId) {
   return new Promise((resolve, reject) => {
-    let completedCount = 0;
     let settled = false;
-    const segmentFramesProcessed = new Array(segments.length).fill(0);
-    const segmentFps = new Array(segments.length).fill(0);
-    const segmentStartTimes = new Array(segments.length).fill(Date.now());
-    const segmentPocs = segments.map(() => new Set());
-    const activeEncoders = new Set();
-    const pendingSegments = [...segments.keys()];
-    const runningSegments = new Set();
-    const startedSegments = new Set();
-    const attemptsBySegment = new Array(segments.length).fill(0);
-    const lastProgressLogAt = new Array(segments.length).fill(0);
-    const concurrency = Math.max(1, Math.min(parallelism?.encoderConcurrency || segments.length, segments.length));
-    const logicalCpus = parallelism?.logicalCpus || Math.max(1, os.cpus().length);
-    const encoderThreads = 1;
-    const targetCpuThreads = parallelism?.targetCpuThreads || logicalCpus;
-    const actualCpuThreads = parallelism?.actualCpuThreads || (concurrency * encoderThreads);
-    addLog(`Encoder scheduling: up to ${concurrency} parallel avmenc.exe process(es) x ${encoderThreads} thread each, targeting ${targetCpuThreads}/${logicalCpus} logical CPU thread(s).`);
-
-    const progressTimer = setInterval(() => {
-      if (!isActiveRun(runId)) {
-        settleReject(new CancellationError());
-        return;
-      }
-      updateProgress();
-    }, 1000);
+    let attempt = 1;
+    let encoderProcess = null;
+    let stallTimer = null;
+    let lastOutputAt = Date.now();
+    let currentFrame = 0;
+    let fps = 0;
+    let lastProgressLogTime = 0;
+    const pocSet = new Set();
 
     const settleReject = (err) => {
       if (settled) return;
       settled = true;
-      clearInterval(progressTimer);
-      for (const enc of activeEncoders) {
-        if (!enc.killed) {
-          try { enc.kill('SIGINT'); } catch(e) {}
-        }
+      clearInterval(stallTimer);
+      if (encoderProcess && !encoderProcess.killed) {
+        try { encoderProcess.kill('SIGINT'); } catch(e) {}
       }
       reject(err);
     };
@@ -726,171 +511,126 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
     const settleResolve = () => {
       if (settled) return;
       settled = true;
-      clearInterval(progressTimer);
+      clearInterval(stallTimer);
       resolve();
     };
 
-    function handleEncoderOutput(i, data, source) {
-      const text = data.toString();
-
-      if (!isActiveRun(runId)) {
-        settleReject(new CancellationError());
-        return;
-      }
-
-      let updated = false;
-      const frameMatch = text.match(/frame\s+(\d+)\/(\d+)\s+\d+\s+ms\s+([\d.]+)\s+fps/i);
-      if (frameMatch) {
-        const currentFrame = Math.min(parseInt(frameMatch[1]), segments[i].frames);
-        segmentFramesProcessed[i] = Math.max(segmentFramesProcessed[i], currentFrame);
-        segmentFps[i] = parseFloat(frameMatch[3]);
-        updated = true;
-      }
-
-      const simpleMatch = text.match(/\b(\d+)\/(\d+)\b/);
-      if (simpleMatch) {
-        const currentFrame = Math.min(parseInt(simpleMatch[1]), segments[i].frames);
-        segmentFramesProcessed[i] = Math.max(segmentFramesProcessed[i], currentFrame);
-        updated = true;
-      }
-
-      const pocMatches = [...text.matchAll(/POC:\s*(\d+)/g)];
-      if (pocMatches.length > 0) {
-        for (const match of pocMatches) {
-          segmentPocs[i].add(parseInt(match[1]));
-        }
-        const currentFrame = Math.min(segmentPocs[i].size, segments[i].frames);
-        segmentFramesProcessed[i] = Math.max(segmentFramesProcessed[i], currentFrame);
-        updated = true;
-      }
-
-      if (updated) {
-        const elapsedSeconds = Math.max((Date.now() - segmentStartTimes[i]) / 1000, 0.001);
-        if (segmentFps[i] === 0 && segmentFramesProcessed[i] > 0) {
-          segmentFps[i] = segmentFramesProcessed[i] / elapsedSeconds;
-        }
-        maybeLogSegmentProgress(i);
-        updateProgress();
-      }
-    }
-
-    function buildEncoderArgs(seg, attempt) {
+    function buildEncoderArgs(attemptCount) {
       const speedValue = clampInt(speed, 0, 9, 8);
       const qpValue = clampInt(qp, 0, 255, 45);
       const args = [
         '--disable-warning-prompt',
         `--qp=${qpValue}`,
         `--cpu-used=${speedValue}`,
-        '--threads=1',
+        '--threads=1'
       ];
 
-      if (attempt === 1) {
-        args.push('--kf-min-dist=1', '--kf-max-dist=1');
-      } else if (attempt === 2) {
-        args.push('--auto-alt-ref=0', '--kf-min-dist=1', '--kf-max-dist=1');
-      } else if (attempt === 3) {
+      if (attemptCount === 2) {
         args.push(
           '--auto-alt-ref=0',
           '--enable-keyframe-filtering=0',
           '--enable-overlay=0',
-          '--monotonic-output-order=1',
+          '--monotonic-output-order=1'
         );
+      } else if (attemptCount === 3) {
+        args.push('--kf-min-dist=1', '--kf-max-dist=1');
       }
-      if (seg.frames > 0) {
-        args.push(`--limit=${seg.frames}`);
+
+      if (totalFrames > 0) {
+        args.push(`--limit=${totalFrames}`);
       }
-      args.push('-o', seg.av2Path, seg.y4mPath);
+      args.push('-o', av2Path, y4mPath);
       return args;
     }
 
-    function maybeLogSegmentProgress(i) {
-      const now = Date.now();
-      if (now - lastProgressLogAt[i] < ENCODER_PROGRESS_LOG_INTERVAL_MS) return;
-      lastProgressLogAt[i] = now;
+    function handleEncoderOutput(data) {
+      const text = data.toString();
+      let updated = false;
 
-      const frames = segmentFramesProcessed[i];
-      const total = segments[i].frames;
-      const fps = segmentFps[i] || 0;
-      addLog(`[Segment ${i}] Progress: ${frames}/${total} frames (${fps.toFixed(2)} fps)`);
+      const frameMatch = text.match(/frame\s+(\d+)\/(\d+)\s+\d+\s+ms\s+([\d.]+)\s+fps/i);
+      if (frameMatch) {
+        currentFrame = Math.min(parseInt(frameMatch[1]), totalFrames);
+        fps = parseFloat(frameMatch[3]);
+        updated = true;
+      }
+
+      const simpleMatch = text.match(/\b(\d+)\/(\d+)\b/);
+      if (simpleMatch) {
+        currentFrame = Math.min(parseInt(simpleMatch[1]), totalFrames);
+        updated = true;
+      }
+
+      const pocMatches = [...text.matchAll(/POC:\s*(\d+)/g)];
+      if (pocMatches.length > 0) {
+        for (const match of pocMatches) {
+          pocSet.add(parseInt(match[1]));
+        }
+        currentFrame = Math.min(pocSet.size, totalFrames);
+        updated = true;
+      }
+
+      if (updated) {
+        const elapsedSeconds = Math.max((Date.now() - lastOutputAt) / 1000, 0.001);
+        if (fps === 0 && currentFrame > 0) {
+          fps = currentFrame / elapsedSeconds;
+        }
+        
+        // Log periodically
+        const now = Date.now();
+        if (now - lastProgressLogTime > ENCODER_PROGRESS_LOG_INTERVAL_MS) {
+          lastProgressLogTime = now;
+          addLog(`Encoding progress: ${currentFrame}/${totalFrames} frames (${fps.toFixed(2)} fps)`);
+        }
+
+        updateProgress();
+      }
     }
 
-    function startNextSegments() {
+    function updateProgress() {
+      const progress = Math.min(((currentFrame / totalFrames) * 100), 99.9).toFixed(1);
+      let eta = currentFrame > 0 ? 'Calculating...' : 'Working...';
+      if (fps > 0) {
+        const remainingFrames = Math.max(totalFrames - currentFrame, 0);
+        const remainingSeconds = remainingFrames / fps;
+        const hours = Math.floor(remainingSeconds / 3600);
+        const minutes = Math.floor((remainingSeconds % 3600) / 60);
+        const seconds = Math.floor(remainingSeconds % 60);
+        eta = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+      }
+
+      updateJob({
+        progress,
+        currentFrame,
+        fps: fps.toFixed(2),
+        eta
+      });
+    }
+
+    function startAttempt() {
       if (settled) return;
       if (!isActiveRun(runId)) {
         settleReject(new CancellationError());
         return;
       }
 
-      while (runningSegments.size < concurrency && pendingSegments.length > 0) {
-        const i = pendingSegments.shift();
-        runSegmentAttempt(i);
-      }
-
-      if (completedCount === segments.length) {
-        settleResolve();
-      }
-    }
-
-    function retryOrFailSegment(i, code, stderrTail, stdoutTail) {
-      const seg = segments[i];
-      runningSegments.delete(i);
-      const attempt = attemptsBySegment[i];
-      const canRetry = attempt < MAX_ENCODER_ATTEMPTS;
-
-      if (canRetry) {
-        const crashNote = AVM_CRASH_EXIT_CODES.has(code) ? 'access violation' : `exit code ${code}`;
-        addLog(`[Segment ${i}] avmenc.exe failed with ${crashNote}; retrying attempt ${attempt + 1}/${MAX_ENCODER_ATTEMPTS} with safer settings...`);
-        if (stdoutTail) addLog(`[Segment ${i}] stdout tail before retry: ${stdoutTail}`);
-        if (stderrTail) addLog(`[Segment ${i}] stderr tail before retry: ${stderrTail}`);
-        try {
-          if (fs.existsSync(seg.av2Path)) {
-            fs.unlinkSync(seg.av2Path);
-          }
-        } catch(e) {}
-        segmentFramesProcessed[i] = Math.max(segmentFramesProcessed[i], Math.min(1, seg.frames));
-        segmentFps[i] = 0;
-        segmentPocs[i].clear();
-        pendingSegments.unshift(i);
-        startNextSegments();
-        return;
-      }
-
-      const details = [
-        `Segment ${i} avmenc.exe failed after ${attempt} attempts with exit code ${code}`,
-        stdoutTail ? `stdout tail: ${stdoutTail}` : '',
-        stderrTail ? `stderr tail: ${stderrTail}` : ''
-      ].filter(Boolean).join(' | ');
-      settleReject(new Error(details));
-    }
-
-    function runSegmentAttempt(i) {
-      const seg = segments[i];
-      runningSegments.add(i);
-      attemptsBySegment[i]++;
-      segmentStartTimes[i] = Date.now();
+      const args = buildEncoderArgs(attempt);
       let stdoutTail = '';
       let stderrTail = '';
-
-      const attempt = attemptsBySegment[i];
-      const args = buildEncoderArgs(seg, attempt);
-      let lastOutputAt = Date.now();
-      let encoderClosed = false;
       let killedForStall = false;
+      let encoderClosed = false;
 
       if (attempt > 1) {
-        addLog(`[Segment ${i}] Retry attempt ${attempt}/${MAX_ENCODER_ATTEMPTS}: ${AVM_ENC_PATH} ${args.join(' ')}`);
+        addLog(`Retry attempt ${attempt}/${MAX_ENCODER_ATTEMPTS}: ${AVM_ENC_PATH} ${args.join(' ')}`);
       } else {
-        addLog(`[Segment ${i}] Running: ${AVM_ENC_PATH} ${args.join(' ')}`);
+        addLog(`Running: ${AVM_ENC_PATH} ${args.join(' ')}`);
       }
 
       const encoder = spawn(AVM_ENC_PATH, args);
-      activeEncoders.add(encoder);
+      encoderProcess = encoder;
       activeProcesses.push(encoder);
-      startedSegments.add(i);
-      segmentFramesProcessed[i] = Math.max(segmentFramesProcessed[i], Math.min(Math.ceil(seg.frames * 0.25), seg.frames));
-      updateProgress();
+      lastOutputAt = Date.now();
 
-      const stallTimer = setInterval(() => {
+      stallTimer = setInterval(() => {
         if (encoderClosed || settled) {
           clearInterval(stallTimer);
           return;
@@ -898,10 +638,10 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
 
         const now = Date.now();
         const stalled = now - lastOutputAt > ENCODER_STALL_TIMEOUT_MS;
-        const expired = now - segmentStartTimes[i] > ENCODER_ABSOLUTE_TIMEOUT_MS;
+        const expired = now - lastOutputAt > ENCODER_ABSOLUTE_TIMEOUT_MS;
         if (stalled || expired) {
           killedForStall = true;
-          addLog(`[Segment ${i}] avmenc.exe produced no progress for ${Math.round((now - lastOutputAt) / 1000)}s; restarting with safer settings...`);
+          addLog(`avmenc.exe produced no progress for ${Math.round((now - lastOutputAt) / 1000)}s; restarting with safer settings...`);
           try { encoder.kill('SIGINT'); } catch(e) {}
           setTimeout(() => {
             if (!encoderClosed) {
@@ -918,25 +658,24 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
         }
         disableProcessEcoQoS(encoder.pid);
       } catch (e) {
-        console.error(`Failed to set priority for segment ${i}:`, e);
+        console.error(`Failed to set priority for encoder:`, e);
       }
 
       encoder.stderr.on('data', (data) => {
         lastOutputAt = Date.now();
         stderrTail = (stderrTail + data.toString()).slice(-2000);
-        handleEncoderOutput(i, data, 'stderr');
+        handleEncoderOutput(data);
       });
       encoder.stdout.on('data', (data) => {
         lastOutputAt = Date.now();
         stdoutTail = (stdoutTail + data.toString()).slice(-2000);
-        handleEncoderOutput(i, data, 'stdout');
+        handleEncoderOutput(data);
       });
 
       encoder.on('close', (code) => {
         encoderClosed = true;
         clearInterval(stallTimer);
         activeProcesses = activeProcesses.filter(p => p !== encoder);
-        activeEncoders.delete(encoder);
 
         if (settled) return;
         if (!isActiveRun(runId)) {
@@ -945,69 +684,55 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, paralle
         }
 
         if (killedForStall) {
-          retryOrFailSegment(i, 'stalled', stderrTail.trim(), stdoutTail.trim());
+          handleFailure('stalled', stderrTail, stdoutTail);
           return;
         }
 
         if (code !== 0) {
-          retryOrFailSegment(i, code, stderrTail.trim(), stdoutTail.trim());
+          handleFailure(`exit code ${code}`, stderrTail, stdoutTail);
           return;
         }
 
-        if (!fs.existsSync(seg.av2Path) || fs.statSync(seg.av2Path).size === 0) {
-          retryOrFailSegment(i, 'missing-output', stderrTail.trim(), stdoutTail.trim());
+        if (!fs.existsSync(av2Path) || fs.statSync(av2Path).size === 0) {
+          handleFailure('missing-output', stderrTail, stdoutTail);
           return;
         }
 
-        runningSegments.delete(i);
-        segmentFramesProcessed[i] = seg.frames;
-        const elapsedSeconds = Math.max((Date.now() - segmentStartTimes[i]) / 1000, 0.001);
-        segmentFps[i] = seg.frames / elapsedSeconds;
-        completedCount++;
-        updateProgress();
-        startNextSegments();
+        settleResolve();
       });
 
       encoder.on('error', (err) => {
         encoderClosed = true;
         clearInterval(stallTimer);
         activeProcesses = activeProcesses.filter(p => p !== encoder);
-        activeEncoders.delete(encoder);
-        runningSegments.delete(i);
-        settleReject(new Error(`Segment ${i} avmenc.exe failed to start: ${err.message}`));
+        settleReject(new Error(`avmenc.exe failed to start: ${err.message}`));
       });
     }
 
-    startNextSegments();
-
-    // Batch-disable EcoQoS for encoder PIDs shortly after startup.
-    setTimeout(() => disableEcoQoSForPids([...activeEncoders].map(e => e.pid)), 250);
-
-    function updateProgress() {
-      if (settled && completedCount !== segments.length) return;
-
-      const totalProcessed = segmentFramesProcessed.reduce((a, b) => a + b, 0);
-      const progress = Math.min(((totalProcessed / totalFrames) * 100), 99.9).toFixed(1);
-      const overallFps = segmentFps.reduce((a, b) => a + b, 0);
-
-      let eta = totalProcessed > 0 ? 'Calculating...' : 'Working...';
-      if (overallFps > 0) {
-        const remainingFrames = Math.max(totalFrames - totalProcessed, 0);
-        const remainingSeconds = remainingFrames / overallFps;
-        const hours = Math.floor(remainingSeconds / 3600);
-        const minutes = Math.floor((remainingSeconds % 3600) / 60);
-        const seconds = Math.floor(remainingSeconds % 60);
-        eta = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+    function handleFailure(reason, stderrTail, stdoutTail) {
+      attempt++;
+      if (attempt <= MAX_ENCODER_ATTEMPTS) {
+        addLog(`avmenc.exe failed due to ${reason}; retrying attempt ${attempt}/${MAX_ENCODER_ATTEMPTS} with safer settings...`);
+        if (stdoutTail) addLog(`stdout tail before retry: ${stdoutTail.trim()}`);
+        if (stderrTail) addLog(`stderr tail before retry: ${stderrTail.trim()}`);
+        try {
+          if (fs.existsSync(av2Path)) {
+            fs.unlinkSync(av2Path);
+          }
+        } catch(e) {}
+        pocSet.clear();
+        startAttempt();
+      } else {
+        const details = [
+          `avmenc.exe failed after ${attempt - 1} attempts due to ${reason}`,
+          stdoutTail ? `stdout tail: ${stdoutTail.trim()}` : '',
+          stderrTail ? `stderr tail: ${stderrTail.trim()}` : ''
+        ].filter(Boolean).join(' | ');
+        settleReject(new Error(details));
       }
-
-      updateJob({
-        progress,
-        currentFrame: totalProcessed,
-        totalFrames,
-        fps: overallFps.toFixed(2),
-        eta
-      });
     }
+
+    startAttempt();
   });
 }
 
@@ -1063,7 +788,7 @@ function findTrackEntryStart(buf, codecIdIdx) {
 
 function patchWebMToFFV1(filePath) {
   if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) {
-    throw new Error(`Temporary AV2 segment is missing or empty: ${filePath}`);
+    throw new Error(`Temporary AV2 file is missing or empty: ${filePath}`);
   }
 
   const buf = fs.readFileSync(filePath);
@@ -1144,8 +869,8 @@ function patchMKVToAV2(filePath) {
   fs.writeFileSync(filePath, patched);
 }
 
-// Spawns ffmpeg to concat segments and mux audio
-function muxSegmentsWithAudio({ listPath, sourcePath, outputPath, audioMode, audioBitrate, limitFrames, finalOutputPath, runId }) {
+// Spawns ffmpeg to mux audio with encoded video
+function muxWithAudio({ videoPath, sourcePath, outputPath, audioMode, audioBitrate, limitFrames, finalOutputPath, runId }) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const settleResolve = () => {
@@ -1162,7 +887,7 @@ function muxSegmentsWithAudio({ listPath, sourcePath, outputPath, audioMode, aud
     const isWebM = (finalOutputPath || outputPath).toLowerCase().endsWith('.webm');
     const ab = audioBitrate || 128;
     
-    let args = ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-i', sourcePath];
+    let args = ['-y', '-i', videoPath, '-i', sourcePath];
     
     if (audioMode === 'none') {
       args.push('-map', '0:v', '-c:v', 'copy', '-an');
@@ -1225,7 +950,7 @@ function muxSegmentsWithAudio({ listPath, sourcePath, outputPath, audioMode, aud
       } else {
         const errorMsg = ffmpegStderr.join('').trim();
         addLog(`FFmpeg stderr output:\n${errorMsg}`);
-        settleReject(new Error(`ffmpeg failed during segment concatenation with code ${code}`));
+        settleReject(new Error(`ffmpeg failed during muxing with code ${code}`));
       }
     });
 
