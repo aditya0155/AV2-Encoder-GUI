@@ -563,7 +563,7 @@ export default function App() {
                       <input type="range" className="slider" min="1" max={Math.max(16, maxCpus)} value={workers} onChange={(e) => setWorkers(parseInt(e.target.value))} disabled={isEncoding} />
                     </div>
                     <span style={{ fontSize: '11px', color: 'var(--text-low)', display: 'block', marginTop: '6px' }}>
-                      Spawns parallel instances of avmenc.exe to encode segment chunks, utilizing multiple CPU cores. Recommended: use all logical processors (default).
+                      Spawns parallel instances of avmenc.exe to encode segment chunks, utilizing multiple CPU cores. <strong>Recommended: use all logical processors (default).</strong>
                     </span>
                   </div>
                 </div>
