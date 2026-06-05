@@ -36,9 +36,9 @@ let tempMuxPath = '';
 let tempListPath = '';
 let activeSegments = [];
 
-// Minimum frames per segment — avmenc only emits progress every ~1 frame but
-// needs enough frames to be observable and to justify process spawn overhead.
-const MIN_FRAMES_PER_SEGMENT = 10;
+// Keep chunks long enough for AVM's lookahead/reference structure. Very short
+// chunks can underuse CPU and have been observed to crash the Windows build.
+const MIN_FRAMES_PER_SEGMENT = 32;
 const MAX_ENCODER_ATTEMPTS = 3;
 const AVM_CRASH_EXIT_CODES = new Set([
   3221225477, // 0xC0000005 access violation, reported by Windows as an unsigned exit code.
@@ -142,6 +142,71 @@ function updateJob(fields) {
   broadcast({ type: 'status', status: currentJob });
 }
 
+function clampInt(value, min, max, fallback) {
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+function getScaledDimensions(videoInfo, resolutionScale) {
+  const sourceWidth = parseInt(videoInfo.width, 10) || 0;
+  const sourceHeight = parseInt(videoInfo.height, 10) || 0;
+  const scaleWidths = {
+    '1080p': 1920,
+    '720p': 1280,
+    '480p': 854,
+    '360p': 640,
+    '240p': 426
+  };
+
+  const targetWidth = scaleWidths[resolutionScale] || sourceWidth;
+  if (!targetWidth || !sourceWidth || !sourceHeight) {
+    return { width: sourceWidth, height: sourceHeight };
+  }
+
+  const scaledHeight = Math.max(2, Math.round((sourceHeight * targetWidth / sourceWidth) / 2) * 2);
+  return { width: targetWidth, height: scaledHeight };
+}
+
+function planParallelism(totalFrames, requestedWorkers) {
+  const logicalCpus = Math.max(1, os.cpus().length);
+  const targetCpuThreads = clampInt(requestedWorkers, 1, logicalCpus, logicalCpus);
+  const maxSegmentsByFrames = Math.max(1, Math.floor(totalFrames / MIN_FRAMES_PER_SEGMENT));
+  const numSegments = Math.max(1, Math.min(targetCpuThreads, totalFrames, maxSegmentsByFrames));
+  const threadsPerEncoder = Math.max(1, Math.ceil(targetCpuThreads / numSegments));
+
+  return {
+    logicalCpus,
+    targetCpuThreads,
+    numSegments,
+    threadsPerEncoder
+  };
+}
+
+function getEncoderTileArgs(width, height, threads) {
+  if (threads <= 1) return ['--row-mt=1'];
+
+  const maxColsLog = width >= 1920 ? 2 : (width >= 854 ? 1 : 0);
+  const maxRowsLog = height >= 480 ? 1 : 0;
+  let colsLog = 0;
+  let rowsLog = 0;
+
+  while ((1 << (colsLog + rowsLog)) < threads && (colsLog < maxColsLog || rowsLog < maxRowsLog)) {
+    if (colsLog < maxColsLog && (colsLog <= rowsLog || rowsLog >= maxRowsLog)) {
+      colsLog++;
+    } else if (rowsLog < maxRowsLog) {
+      rowsLog++;
+    } else {
+      break;
+    }
+  }
+
+  const args = ['--row-mt=1'];
+  if (colsLog > 0) args.push(`--tile-columns=${colsLog}`);
+  if (rowsLog > 0) args.push(`--tile-rows=${rowsLog}`);
+  return args;
+}
+
 export function cancelEncoding() {
   cancelRequested = true;
   currentRunId++;
@@ -222,6 +287,19 @@ export function startEncoding({ inputFile, outputFile, qp, speed, audioMode, aud
     return { error: `Input file does not exist: ${inputFile}` };
   }
 
+  if (!fs.existsSync(AVM_ENC_PATH)) {
+    return { error: `AVM encoder not found: ${AVM_ENC_PATH}` };
+  }
+
+  if (path.resolve(inputFile).toLowerCase() === path.resolve(outputFile).toLowerCase()) {
+    return { error: 'Output file must be different from the input file.' };
+  }
+
+  const outputDir = path.dirname(outputFile);
+  if (!fs.existsSync(outputDir)) {
+    return { error: `Output directory does not exist: ${outputDir}` };
+  }
+
   currentRunId++;
   cancelRequested = false;
   activeProcesses = [];
@@ -281,15 +359,15 @@ async function runPipeline({ inputFile, outputFile, qp, speed, audioMode, audioB
     // Step 2: Slicing into segments
     updateJob({ status: 'preparing' });
     
-    const parsedWorkers = Math.max(1, parseInt(workers) || os.cpus().length);
-    // Cap segments so each gets at least MIN_FRAMES_PER_SEGMENT frames.
-    // This prevents avmenc from completing before emitting any progress line,
-    // which would leave the UI stuck at 0%.
-    const maxSegmentsByFrames = Math.max(1, Math.floor(jobTotalFrames / MIN_FRAMES_PER_SEGMENT));
-    const numSegments = Math.min(parsedWorkers, jobTotalFrames, maxSegmentsByFrames);
+    const parallelism = planParallelism(jobTotalFrames, workers);
+    const outputDimensions = getScaledDimensions(videoInfo, resolutionScale);
+    const numSegments = parallelism.numSegments;
     const framesPerSegment = Math.floor(jobTotalFrames / numSegments);
-    if (numSegments < parsedWorkers) {
-      addLog(`Note: Reduced workers from ${parsedWorkers} → ${numSegments} to ensure each segment has at least ${MIN_FRAMES_PER_SEGMENT} frames.`);
+    if (parallelism.targetCpuThreads < (parseInt(workers, 10) || parallelism.logicalCpus)) {
+      addLog(`Note: Capped requested CPU threads at ${parallelism.targetCpuThreads}, matching available logical CPUs.`);
+    }
+    if (numSegments < parallelism.targetCpuThreads) {
+      addLog(`Note: Planned ${numSegments} encoder segment(s) with about ${parallelism.threadsPerEncoder} thread(s) each so chunks stay at least ${MIN_FRAMES_PER_SEGMENT} frames.`);
     }
     const segments = [];
     let startFrame = 0;
@@ -307,6 +385,8 @@ async function runPipeline({ inputFile, outputFile, qp, speed, audioMode, audioB
         startFrame,
         endFrame,
         frames: segmentFrames,
+        width: outputDimensions.width,
+        height: outputDimensions.height,
         y4mPath: path.join(fileDir, `${fileBaseName}_temp_seg${i}.y4m`),
         av2Path: path.join(fileDir, `${fileBaseName}_temp_seg${i}.av2`)
       });
@@ -323,7 +403,7 @@ async function runPipeline({ inputFile, outputFile, qp, speed, audioMode, audioB
     // Step 3: Run the parallel AV2 encoders
     updateJob({ status: 'encoding' });
     addLog(`Step 2/3: Encoding ${numSegments} video segments in parallel using all cores...`);
-    await runParallelAV2Encoders(segments, qp, speed, jobTotalFrames, runId);
+    await runParallelAV2Encoders(segments, qp, speed, jobTotalFrames, runId, parallelism);
     throwIfCancelled(runId);
     addLog('AV2 parallel encoding complete.');
 
@@ -404,15 +484,20 @@ function probeVideo(filePath) {
 
     const probe = spawn('ffprobe', args);
     let output = '';
+    let stderr = '';
 
     probe.stdout.on('data', (data) => { output += data; });
+    probe.stderr.on('data', (data) => { stderr += data; });
     probe.on('close', (code) => {
       if (code !== 0) {
-        return reject(new Error('ffprobe failed to probe input video'));
+        return reject(new Error(`ffprobe failed to probe input video: ${stderr.trim() || `exit code ${code}`}`));
       }
 
       try {
         const data = JSON.parse(output);
+        if (!data.streams || data.streams.length === 0) {
+          throw new Error('no video stream found');
+        }
         const stream = data.streams[0];
         let totalFrames = parseInt(stream.nb_frames);
         
@@ -439,6 +524,10 @@ function probeVideo(filePath) {
       } catch (e) {
         reject(new Error('Failed to parse ffprobe output: ' + e.message));
       }
+    });
+
+    probe.on('error', (err) => {
+      reject(new Error(`ffprobe failed to start: ${err.message}`));
     });
   });
 }
@@ -492,7 +581,7 @@ function splitVideoIntoSegments(inputFile, segments, resolutionScale, limitFrame
     }
     
     let parsedHeader = false;
-    let frameSize = 0;
+    let framePayloadSize = 0;
     let currentSegmentIndex = 0;
     let buffer = Buffer.alloc(0);
     
@@ -522,7 +611,7 @@ function splitVideoIntoSegments(inputFile, segments, resolutionScale, limitFrame
           
           const width = parseInt(widthMatch[1]);
           const height = parseInt(heightMatch[1]);
-          frameSize = 6 + Math.floor(width * height * 1.5);
+          framePayloadSize = Math.floor(width * height * 1.5);
           
           // Write Y4M header to each segment file
           for (let i = 0; i < segments.length; i++) {
@@ -535,7 +624,20 @@ function splitVideoIntoSegments(inputFile, segments, resolutionScale, limitFrame
       }
       
       if (parsedHeader) {
-        while (buffer.length >= frameSize) {
+        while (true) {
+          const frameHeaderEnd = buffer.indexOf(0x0a);
+          if (frameHeaderEnd === -1) break;
+
+          const frameHeader = buffer.slice(0, frameHeaderEnd + 1);
+          if (!frameHeader.toString('ascii').startsWith('FRAME')) {
+            try { ffmpeg.kill('SIGINT'); } catch(e) {}
+            settleReject(new Error('Invalid Y4M frame header from FFmpeg'));
+            return;
+          }
+
+          const frameSize = frameHeaderEnd + 1 + framePayloadSize;
+          if (buffer.length < frameSize) break;
+
           const frameBytes = buffer.slice(0, frameSize);
           buffer = buffer.slice(frameSize);
           
@@ -590,7 +692,7 @@ function splitVideoIntoSegments(inputFile, segments, resolutionScale, limitFrame
 }
 
 // Spawns multiple avmenc.exe instances in parallel and aggregates progress.
-function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
+function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId, parallelism) {
   return new Promise((resolve, reject) => {
     let completedCount = 0;
     let settled = false;
@@ -604,9 +706,10 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
     const attemptsBySegment = new Array(segments.length).fill(0);
     const lastProgressLogAt = new Array(segments.length).fill(0);
     const concurrency = Math.max(1, segments.length);
-    const logicalCpus = Math.max(1, os.cpus().length);
-    const encoderThreads = Math.max(1, Math.floor(logicalCpus / concurrency));
-    addLog(`Encoder threading: ${concurrency} parallel workers x ${encoderThreads} thread(s) each across ${logicalCpus} logical CPU(s).`);
+    const logicalCpus = parallelism?.logicalCpus || Math.max(1, os.cpus().length);
+    const encoderThreads = Math.max(1, parallelism?.threadsPerEncoder || Math.ceil(logicalCpus / concurrency));
+    const targetCpuThreads = parallelism?.targetCpuThreads || logicalCpus;
+    addLog(`Encoder threading: ${concurrency} parallel encoder(s) x ${encoderThreads} thread(s) each, targeting ${targetCpuThreads}/${logicalCpus} logical CPU thread(s).`);
 
     const progressTimer = setInterval(() => {
       if (!isActiveRun(runId)) {
@@ -680,15 +783,18 @@ function runParallelAV2Encoders(segments, qp, speed, totalFrames, runId) {
     }
 
     function buildEncoderArgs(seg, attempt) {
-      const safeSpeed = Math.min(parseInt(speed) || 9, 8);
+      const speedValue = clampInt(speed, 0, 9, 8);
+      const safeSpeed = Math.min(speedValue, 8);
+      const qpValue = clampInt(qp, 0, 255, 45);
       const threads = attempt === 1
         ? encoderThreads
         : (attempt === 2 ? Math.max(1, Math.floor(encoderThreads / 2)) : 1);
       const args = [
         '--disable-warning-prompt',
-        `--qp=${qp}`,
-        `--cpu-used=${attempt >= 3 ? safeSpeed : speed}`,
+        `--qp=${qpValue}`,
+        `--cpu-used=${attempt >= 3 ? safeSpeed : speedValue}`,
         `--threads=${threads}`,
+        ...getEncoderTileArgs(seg.width || 0, seg.height || 0, threads),
       ];
       if (seg.frames > 0) {
         args.push(`--limit=${seg.frames}`);
